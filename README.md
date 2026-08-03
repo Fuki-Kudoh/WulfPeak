@@ -1,7 +1,13 @@
 # WulfPeak
 
-WulfPeak v0.1.0 uses a compact samplesheet and automatically discovers paired
-FASTQ files. Single-end reads are not supported in v0.1.0.
+WulfPeak uses a compact samplesheet and exact, non-recursive FASTQ discovery.
+The v0.2.0 execution foundation supports paired-end (default) and single-end
+input validation, full preflight, deterministic dry-run command plans, status
+inspection, and output-manifest validation.
+
+This implementation slice intentionally does not execute analysis commands.
+Use `wulfpeak run --dry-run`; FastQC through reporting execution is added in
+the next implementation PRs.
 
 ## Samplesheet
 
@@ -9,51 +15,43 @@ FASTQ files. Single-end reads are not supported in v0.1.0.
 
 | Column | Meaning |
 | --- | --- |
-| `input_id` | Original sequencing/FASTQ-derived identifier used for raw FASTQ discovery. Must be unique. |
-| `sample_id` | Canonical WulfPeak sample name used by all per-sample outputs. Must be unique. |
-| `group_id` | Non-empty replicate group used for consensus peaks and pooled BAM/peak generation. |
+| `input_id` | Raw FASTQ discovery identifier. Unique within the run. |
+| `sample_id` | Path-safe canonical output name. Unique within the run. |
+| `group_id` | Path-safe replicate group identifier. |
 | `peak_type` | `narrow`, `broad`, or `input`. |
-| `control` | Matched input's `sample_id`, or `.`. Input rows must use `.`. |
-| `qvalue` | Finite MACS `callpeak -q` value satisfying `0 < qvalue <= 1`. Input rows must use `.`. |
+| `control` | Matched input `sample_id`, or `.`. Input rows use `.`. |
+| `qvalue` | Finite `0 < qvalue <= 1` for treatment; `.` for input. |
 
-See [the example samplesheet](examples/samples.tsv).
+See [the paired-end example](examples/samples.tsv) and
+[single-end example](examples/samples-se.tsv). The samplesheet schema is the
+same for both layouts.
 
-The legacy `fastq1` and `fastq2` columns are not accepted. FASTQ paths are
-resolved from `input_id` instead.
-
-All non-input replicates sharing a `group_id` must use the same `peak_type` and
-numerically equivalent `qvalue`. Input rows do not participate in these group
-consistency checks.
+Treatment replicates in one `group_id` must have the same peak type,
+numerically equivalent q-value, and control. The legacy `fastq1` and `fastq2`
+columns are not accepted.
 
 ## Check a run
 
-From the analysis working directory:
+Paired-end is the default:
 
 ```console
-wulfpeak check --samplesheet samples.tsv
+wulfpeak check --samplesheet samples.tsv --fastq-dir ../fastq
 ```
 
-The default raw FASTQ directory is `../fastq`, relative to the current working
-directory. Override it when needed:
+Select single-end with either alias:
 
 ```console
-wulfpeak check --samplesheet samples.tsv --fastq-dir /data/run/fastq
+wulfpeak check --samplesheet samples.tsv --single-end
+wulfpeak check --samplesheet samples.tsv --SE
 ```
 
-`wulfpeak check` validates the entire samplesheet, resolves exactly one R1 and
-one R2 for every row, and prints both resolved paths for every sample. On
-success it writes:
-
-- `WulfPeak_out/config/manifest.json`
-- `WulfPeak_out/qc/sample_qc.tsv`
-
-Both files contain the resolved absolute raw FASTQ paths and canonical trimmed
-FASTQ paths. No manifest or sample QC file is written if validation or FASTQ
-discovery fails.
+On success, `check` writes `WulfPeak_out/config/manifest.json` and
+`WulfPeak_out/qc/sample_qc.tsv`. It writes neither until every row passes.
+Single-end manifests use JSON `null` for R2 and the TSV R2 columns are empty.
 
 ## Supported raw FASTQ names
 
-For an `input_id` of `sample`, the accepted pairs are:
+For an `input_id` of `sample`, accepted paired-end pairs are:
 
 ```text
 sample_R1.fastq.gz       sample_R2.fastq.gz
@@ -64,26 +62,97 @@ sample_1.fastq.gz        sample_2.fastq.gz
 sample_1.fq.gz           sample_2.fq.gz
 ```
 
-Discovery is non-recursive and uses exact literal filenames. If a mate is
-missing, no pair exists, or more than one candidate exists for either mate,
-the check fails without guessing.
+Accepted single-end names are:
 
-## Trimmed FASTQ contract
+```text
+sample.fastq.gz
+sample.fq.gz
+sample_R1.fastq.gz
+sample_R1.fq.gz
+sample_R1_001.fastq.gz
+sample_R1_001.fq.gz
+sample_1.fastq.gz
+sample_1.fq.gz
+```
 
-Raw names are never used to infer trimmed output names. Each resolved sample in
-the manifest declares these canonical downstream paths:
+Discovery is exact and non-recursive. Missing, orphaned, or multiple candidates
+fail without guessing. R2 is an error in single-end mode, never silently
+ignored.
+
+## Canonical trimmed FASTQ paths
+
+Paired-end:
 
 ```text
 WulfPeak_out/trimmed/{sample_id}_R1_val_1.fq.gz
 WulfPeak_out/trimmed/{sample_id}_R2_val_2.fq.gz
 ```
 
-The trimming step is responsible for moving or linking Trim Galore's produced
-files to these paths. Every downstream step must read `trimmed_fastq.r1` and
-`trimmed_fastq.r2` from the manifest.
+Single-end:
+
+```text
+WulfPeak_out/trimmed/{sample_id}_trimmed.fq.gz
+```
+
+Downstream steps consume these manifest paths rather than reconstructing names.
+
+## Validate and plan a run
+
+The analysis executables must already be on `PATH`: FastQC, Trim Galore,
+Bowtie2, samtools, deepTools `bamCoverage`, MACS3, bedtools, and MultiQC.
+WulfPeak does not install tools or load environment modules.
+
+```console
+wulfpeak run \
+  --samplesheet samples.tsv \
+  --fastq-dir ../fastq \
+  --output-dir WulfPeak_out \
+  --assay chipseq \
+  --genome-id synthetic_reference \
+  --bowtie2-index /path/to/index/prefix \
+  --effective-genome-size 1000000 \
+  --threads 8 \
+  --dry-run
+```
+
+Dry-run validates the full samplesheet, FASTQ files, numeric options, complete
+Bowtie2 index family, optional blacklist, output directory, and required tools.
+It writes:
+
+- `config/manifest.json`
+- `config/command_plan.json`
+- `metadata/run_metadata.json`
+- `status/pipeline.status` (`null` for a new output directory)
+- `status/state.json` (initialized only for a new output directory)
+
+It creates no analysis product and no false `done` status. Re-running dry-run
+against an existing output directory preserves all completed and failed state.
+
+Each planned step has ordered `actions` and explicit `artifacts`. Commands that
+produce data on stdout declare an atomic `stdout_path`. Every artifact records
+a distinct step-temporary path, validator, canonical path, and
+`validate_then_atomic_file_replace` promotion. FastQC and MACS3 outputs are
+declared as individual files, so a forced rerun never replaces a non-empty
+parent directory. The consensus plan normalizes each
+replicate to merged BED3, records strict-majority support, merges qualifying
+segments, and declares both the canonical BED3 and support TSV outputs.
+
+## Inspect state and outputs
+
+Status does not require FASTQ, index, or analysis tools:
+
+```console
+wulfpeak status --output-dir WulfPeak_out
+wulfpeak status --output-dir WulfPeak_out --json
+```
+
+`wulfpeak validate-outputs` validates an existing `output_manifest.json`
+without rerunning analysis. The complete kind-specific validator set is
+finished in the reporting/release PR.
 
 ## Development
 
 ```console
-PYTHONPATH=src python -m unittest discover -s tests -v
+PYTHONPATH=src PYTHONPYCACHEPREFIX=/tmp/wulfpeak-pycache \
+  python -m unittest discover -s tests -v
 ```

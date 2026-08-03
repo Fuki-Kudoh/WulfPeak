@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -17,6 +18,7 @@ REQUIRED_COLUMNS = (
     "qvalue",
 )
 PEAK_TYPES = frozenset({"narrow", "broad", "input"})
+SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 class SamplesheetValidationError(ValueError):
@@ -97,10 +99,23 @@ def load_samplesheet(path: str | Path) -> list[Sample]:
             errors.append(
                 f"row {row_number}: contains more tab-separated fields than the header"
             )
-        values = {name: (row.get(name) or "").strip() for name in REQUIRED_COLUMNS}
+        raw_values = {name: (row.get(name) or "") for name in REQUIRED_COLUMNS}
+        values = {name: value.strip() for name, value in raw_values.items()}
         for name in REQUIRED_COLUMNS:
             if not values[name]:
                 errors.append(f"row {row_number}: {name} must be non-empty")
+
+        for name in ("sample_id", "group_id"):
+            value = values[name]
+            if raw_values[name] != value:
+                errors.append(
+                    f"row {row_number}: {name} must not have leading or trailing whitespace"
+                )
+            if value in {".", ".."} or (value and not SAFE_ID.fullmatch(value)):
+                errors.append(
+                    f"row {row_number}: {name} must match {SAFE_ID.pattern!r} and "
+                    "must not be '.' or '..'"
+                )
 
         peak_type = values["peak_type"]
         control = values["control"]
@@ -186,6 +201,13 @@ def load_samplesheet(path: str | Path) -> list[Sample]:
             errors.append(
                 f"group_id {group_id!r}: non-input samples must use the same "
                 f"qvalue; found {', '.join(displayed_qvalues)}"
+            )
+
+        controls = sorted({sample.control for sample in group_samples})
+        if len(controls) > 1:
+            errors.append(
+                f"group_id {group_id!r}: non-input samples must use the same "
+                f"control; found {', '.join(controls)}"
             )
 
     if errors:
