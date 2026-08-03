@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import os
 import shlex
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TextIO
 
 
 class CommandExecutionError(RuntimeError):
@@ -21,6 +22,7 @@ class CommandResult:
     started_at: str
     finished_at: str
     log_path: Path
+    stdout_path: Path | None = None
 
 
 def display_command(argv: list[str] | tuple[str, ...]) -> str:
@@ -33,30 +35,79 @@ class CommandRunner:
         argv: list[str],
         log_path: str | Path,
         *,
-        stdout: TextIO | int | None = None,
+        stdout_path: str | Path | None = None,
     ) -> CommandResult:
         if not argv:
             raise ValueError("command argv must not be empty")
         log = Path(log_path)
         log.parent.mkdir(parents=True, exist_ok=True)
         started = datetime.now(timezone.utc).isoformat()
-        with log.open("a", encoding="utf-8") as handle:
-            handle.write(f"started_at: {started}\ncommand: {display_command(argv)}\n")
-            handle.flush()
-            completed = subprocess.run(
-                argv,
-                check=False,
-                stdout=stdout if stdout is not None else handle,
-                stderr=handle,
-            )
-            finished = datetime.now(timezone.utc).isoformat()
-            handle.write(f"finished_at: {finished}\nexit_code: {completed.returncode}\n")
-        result = CommandResult(tuple(argv), completed.returncode, started, finished, log)
+        destination = Path(stdout_path) if stdout_path is not None else None
+        temporary: Path | None = None
+        output_handle = None
+        try:
+            if destination is not None:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                descriptor, temporary_name = tempfile.mkstemp(
+                    dir=destination.parent,
+                    prefix=f".{destination.name}.",
+                    suffix=".tmp",
+                )
+                temporary = Path(temporary_name)
+                output_handle = os.fdopen(descriptor, "wb")
+            with log.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    f"started_at: {started}\ncommand: {display_command(argv)}\n"
+                )
+                if destination is not None:
+                    handle.write(f"stdout_path: {destination}\n")
+                handle.flush()
+                completed = subprocess.run(
+                    argv,
+                    check=False,
+                    stdout=output_handle if output_handle is not None else handle,
+                    stderr=handle,
+                )
+                if output_handle is not None:
+                    output_handle.flush()
+                    os.fsync(output_handle.fileno())
+                    output_handle.close()
+                    output_handle = None
+                finished = datetime.now(timezone.utc).isoformat()
+                handle.write(
+                    f"finished_at: {finished}\nexit_code: {completed.returncode}\n"
+                )
+            if completed.returncode == 0 and temporary is not None and destination is not None:
+                os.replace(temporary, destination)
+                temporary = None
+        finally:
+            if output_handle is not None:
+                output_handle.close()
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+        result = CommandResult(
+            tuple(argv), completed.returncode, started, finished, log, destination
+        )
         if completed.returncode != 0:
             raise CommandExecutionError(
                 f"Command failed with exit code {completed.returncode}; see {log}"
             )
         return result
+
+    def run_spec(
+        self, command: dict[str, object], log_path: str | Path
+    ) -> CommandResult:
+        """Execute one structured command-plan action."""
+
+        if command.get("type") != "command":
+            raise ValueError("command spec must use type='command'")
+        argv = command.get("argv")
+        if not isinstance(argv, list) or not all(isinstance(item, str) for item in argv):
+            raise ValueError("command spec argv must be a list of strings")
+        stdout_path = command.get("stdout_path")
+        if stdout_path is not None and not isinstance(stdout_path, str):
+            raise ValueError("command spec stdout_path must be a string or null")
+        return self.run(argv, log_path, stdout_path=stdout_path)
 
     def run_pipeline(
         self, commands: list[list[str]], log_path: str | Path

@@ -70,6 +70,16 @@ def run_args(root: Path, *, single_end: bool) -> list[str]:
     return args
 
 
+def command_argvs(step: dict[str, object]) -> list[list[str]]:
+    commands: list[list[str]] = []
+    for action in step["actions"]:
+        if action["type"] == "command":
+            commands.append(action["argv"])
+        elif action["type"] == "pipeline":
+            commands.extend(command["argv"] for command in action["commands"])
+    return commands
+
+
 class RunCliTests(unittest.TestCase):
     def prepare(self, root: Path) -> Path:
         fake_bin = root / "fake_bin"
@@ -137,10 +147,11 @@ class RunCliTests(unittest.TestCase):
             self.assertEqual(code, 0, stdout.getvalue())
             plan = json.loads((root / "out" / "config" / "command_plan.json").read_text())
             align = next(step for step in plan["steps"] if step["phase"] == "align")
-            self.assertIn("-U", align["commands"][0])
-            self.assertNotIn("-1", align["commands"][0])
+            align_argv = command_argvs(align)[0]
+            self.assertIn("-U", align_argv)
+            self.assertNotIn("-1", align_argv)
             trim = next(step for step in plan["steps"] if step["phase"] == "trim")
-            self.assertNotIn("--paired", trim["commands"][0])
+            self.assertNotIn("--paired", command_argvs(trim)[0])
             self.assertFalse((root / "out" / "bam" / "treat_rep1.final.bam").exists())
             self.assertEqual(
                 (root / "out" / "status" / "pipeline.status").read_text().strip(),
@@ -165,12 +176,14 @@ class RunCliTests(unittest.TestCase):
                 self.assertEqual(main(run_args(root, single_end=False)), 0)
             plan = json.loads((root / "out" / "config" / "command_plan.json").read_text())
             align = next(step for step in plan["steps"] if step["phase"] == "align")
-            self.assertIn("-1", align["commands"][0])
-            self.assertIn("-2", align["commands"][0])
-            self.assertIn("--no-mixed", align["commands"][0])
+            align_argv = command_argvs(align)[0]
+            self.assertIn("-1", align_argv)
+            self.assertIn("-2", align_argv)
+            self.assertIn("--no-mixed", align_argv)
             peak = next(step for step in plan["steps"] if step["phase"] == "peak")
-            self.assertIn("BAMPE", peak["commands"][0])
-            self.assertIn("-c", peak["commands"][0])
+            peak_argv = command_argvs(peak)[0]
+            self.assertIn("BAMPE", peak_argv)
+            self.assertIn("-c", peak_argv)
             self.assertEqual(
                 len(
                     [
@@ -181,19 +194,62 @@ class RunCliTests(unittest.TestCase):
                 ),
                 1,
             )
-            self.assertNotIn("--dovetail", align["commands"][0])
+            self.assertNotIn("--dovetail", align_argv)
+            bam_step = next(
+                step for step in plan["steps"] if step["phase"] == "bam_process"
+            )
+            for tool_name in ("flagstat", "stats", "idxstats"):
+                action = next(
+                    action
+                    for action in bam_step["actions"]
+                    if action["type"] == "command"
+                    and tool_name in action["argv"]
+                )
+                self.assertIsNotNone(action["stdout_path"])
+                self.assertEqual(action["stdout_write"], "atomic_replace")
+            for phase in ("bam_process", "coverage", "pool_bam"):
+                step = next(item for item in plan["steps"] if item["phase"] == phase)
+                for artifact in step["artifacts"]:
+                    self.assertNotEqual(
+                        artifact["temporary_path"], artifact["canonical_path"]
+                    )
+                    self.assertEqual(
+                        artifact["promotion"], "validate_then_atomic_replace"
+                    )
+            consensus = next(
+                step for step in plan["steps"] if step["phase"] == "consensus_peak"
+            )
+            self.assertEqual(consensus["metadata"]["required_count"], 2)
+            multiinter = next(
+                action
+                for action in consensus["actions"]
+                if action["type"] == "command" and "multiinter" in action["argv"]
+            )
+            self.assertIsNotNone(multiinter["stdout_path"])
             manifest = json.loads((root / "out" / "config" / "manifest.json").read_text())
             self.assertIn("pooled_bam", manifest["groups"][0]["outputs"])
             metadata = json.loads((root / "out" / "metadata" / "run_metadata.json").read_text())
             self.assertEqual(set(metadata["tools"]), set(REQUIRED_TOOLS))
 
             dovetail_args = run_args(root, single_end=False)
-            dovetail_args.append("--allow-dovetail")
+            blacklist = root / "blacklist.bed"
+            blacklist.write_text("chr1\t0\t10\n", encoding="utf-8")
+            dovetail_args.extend(
+                ["--allow-dovetail", "--blacklist", str(blacklist)]
+            )
             with environment("PATH", f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}"):
                 self.assertEqual(main(dovetail_args), 0)
             plan = json.loads((root / "out" / "config" / "command_plan.json").read_text())
             align = next(step for step in plan["steps"] if step["phase"] == "align")
-            self.assertIn("--dovetail", align["commands"][0])
+            self.assertIn("--dovetail", command_argvs(align)[0])
+            peak = next(step for step in plan["steps"] if step["phase"] == "peak")
+            intersect = next(
+                action
+                for action in peak["actions"]
+                if action["type"] == "command" and "intersect" in action["argv"]
+            )
+            self.assertIsNotNone(intersect["stdout_path"])
+            self.assertEqual(intersect["stdout_write"], "atomic_replace")
 
     def test_non_dry_run_is_rejected_without_claiming_success(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -225,6 +281,42 @@ class RunCliTests(unittest.TestCase):
             self.assertEqual(code, 2)
             self.assertIn("non-empty", stderr.getvalue())
             self.assertFalse((root / "out" / "config" / "command_plan.json").exists())
+
+    def test_dry_run_preserves_existing_done_and_failed_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_bin = self.prepare(root)
+            (root / "samples.tsv").write_text(
+                "input_id\tsample_id\tgroup_id\tpeak_type\tcontrol\tqvalue\n"
+                "raw_treat_01\ttreat_rep1\tfactor_A\tnarrow\t.\t0.01\n",
+                encoding="utf-8",
+            )
+            (root / "fastq" / "raw_treat_01.fastq.gz").write_bytes(b"synthetic")
+            selected_path = f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}"
+            with environment("PATH", selected_path):
+                self.assertEqual(main(run_args(root, single_end=True)), 0)
+            state_path = root / "out" / "status" / "state.json"
+            pipeline_path = root / "out" / "status" / "pipeline.status"
+            for status in ("done", "failed"):
+                with self.subTest(status=status):
+                    state = {
+                        "steps": {
+                            "sample:treat_rep1:trim": {
+                                "key": "trim",
+                                "status": status,
+                                "signature": f"preserve-{status}",
+                            }
+                        }
+                    }
+                    state_text = json.dumps(state, indent=2) + "\n"
+                    state_path.write_text(state_text, encoding="utf-8")
+                    pipeline_path.write_text(status + "\n", encoding="utf-8")
+                    with environment("PATH", selected_path):
+                        self.assertEqual(main(run_args(root, single_end=True)), 0)
+                    self.assertEqual(state_path.read_text(encoding="utf-8"), state_text)
+                    self.assertEqual(
+                        pipeline_path.read_text(encoding="utf-8"), status + "\n"
+                    )
 
     def test_status_json_does_not_require_inputs_or_tools(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

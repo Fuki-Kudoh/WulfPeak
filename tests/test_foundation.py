@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from wulfpeak.command import CommandExecutionError, CommandRunner
+from wulfpeak.consensus import build_consensus_plan, strict_majority_threshold
 from wulfpeak.preflight import (
     PreflightError,
     validate_blacklist,
@@ -70,6 +71,40 @@ class FoundationTests(unittest.TestCase):
                 runner.run([sys.executable, "-c", "raise SystemExit(7)"], log)
             self.assertIn("exit_code: 7", log.read_text(encoding="utf-8"))
 
+    def test_command_runner_writes_declared_stdout_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            log = root / "stdout.log"
+            destination = root / "artifact.txt"
+            destination.write_text("previous\n", encoding="utf-8")
+            runner = CommandRunner()
+            result = runner.run_spec(
+                {
+                    "type": "command",
+                    "argv": [sys.executable, "-c", "print('replacement')"],
+                    "stdout_path": str(destination),
+                },
+                log,
+            )
+            self.assertEqual(result.stdout_path, destination)
+            self.assertEqual(destination.read_text(), "replacement\n")
+
+            with self.assertRaises(CommandExecutionError):
+                runner.run_spec(
+                    {
+                        "type": "command",
+                        "argv": [
+                            sys.executable,
+                            "-c",
+                            "print('partial'); raise SystemExit(6)",
+                        ],
+                        "stdout_path": str(destination),
+                    },
+                    log,
+                )
+            self.assertEqual(destination.read_text(), "replacement\n")
+            self.assertEqual(list(root.glob(".artifact.txt.*.tmp")), [])
+
     def test_command_runner_checks_every_pipeline_return_code(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             log = Path(temporary) / "pipeline.log"
@@ -103,6 +138,53 @@ class FoundationTests(unittest.TestCase):
             canonical_signature({"input": "x", "option": 1}),
             canonical_signature({"input": "x", "option": 2}),
         )
+
+    def test_strict_majority_consensus_plan_for_one_to_five_replicates(self) -> None:
+        expected_thresholds = {1: 1, 2: 2, 3: 2, 4: 3, 5: 3}
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            for count, expected in expected_thresholds.items():
+                with self.subTest(replicates=count):
+                    sample_ids = tuple(f"treat_rep{index}" for index in range(1, count + 1))
+                    peaks = tuple(
+                        output / "peaks" / f"{sample_id}.narrowPeak"
+                        for sample_id in sample_ids
+                    )
+                    actions, artifacts, metadata = build_consensus_plan(
+                        bedtools="/fake/bin/bedtools",
+                        output_dir=output,
+                        group_id="factor_A",
+                        sample_ids=sample_ids,
+                        replicate_peaks=peaks,
+                    )
+                    self.assertEqual(strict_majority_threshold(count), expected)
+                    self.assertEqual(metadata["required_count"], expected)
+                    self.assertEqual(metadata["sample_ids"], list(sample_ids))
+                    self.assertEqual(len(metadata["normalization"]), count)
+                    multiinter = next(
+                        action
+                        for action in actions
+                        if action["type"] == "command"
+                        and "multiinter" in action["argv"]
+                    )
+                    self.assertTrue(multiinter["stdout_path"].endswith("multiinter.tsv"))
+                    filtering = next(
+                        action
+                        for action in actions
+                        if action.get("operation") == "filter_consensus_support"
+                    )
+                    self.assertEqual(filtering["minimum_support"], expected)
+                    self.assertEqual(filtering["sample_ids"], list(sample_ids))
+                    self.assertEqual(
+                        {artifact["kind"] for artifact in artifacts}, {"bed3", "tsv"}
+                    )
+                    for artifact in artifacts:
+                        self.assertNotEqual(
+                            artifact["temporary_path"], artifact["canonical_path"]
+                        )
+                        self.assertEqual(
+                            artifact["promotion"], "validate_then_atomic_replace"
+                        )
 
     def test_resume_requires_done_signature_outputs_and_upstream(self) -> None:
         state = StepState("trim", "done", signature="abc")

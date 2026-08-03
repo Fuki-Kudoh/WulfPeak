@@ -107,6 +107,10 @@ def prepare_dry_run(config: RunConfig, argv: list[str]) -> tuple[Path, Path, Pat
         metadata_path = atomic_write_json(
             config.output_dir / "metadata" / "run_metadata.json", metadata
         )
-        atomic_write_json(config.output_dir / "status" / "state.json", {"steps": {}})
-        write_pipeline_status(config.output_dir, "null")
+        state_path = config.output_dir / "status" / "state.json"
+        if not state_path.exists():
+            atomic_write_json(state_path, {"steps": {}})
+        pipeline_status = config.output_dir / "status" / "pipeline.status"
+        if not pipeline_status.exists():
+            write_pipeline_status(config.output_dir, "null")
         return manifest_path, plan_path, metadata_path
