@@ -270,16 +270,17 @@ class RunCliTests(unittest.TestCase):
             self.assertIsNotNone(intersect["stdout_path"])
             self.assertEqual(intersect["stdout_write"], "atomic_replace")
 
-    def test_non_dry_run_is_rejected_without_claiming_success(self) -> None:
+    def test_non_dry_run_rejects_stop_after_beyond_coverage(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             args = run_args(root, single_end=True)
             args.remove("--dry-run")
+            args.extend(["--stop-after", "peak"])
             stderr = io.StringIO()
             with contextlib.redirect_stderr(stderr):
                 code = main(args)
             self.assertEqual(code, 2)
-            self.assertIn("not enabled", stderr.getvalue())
+            self.assertIn("beyond the implemented execution boundary", stderr.getvalue())
             self.assertFalse((root / "out" / "status" / "pipeline.status").exists())
 
     def test_dry_run_rejects_empty_fastq_before_tool_detection(self) -> None:

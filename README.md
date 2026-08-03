@@ -1,13 +1,9 @@
 # WulfPeak
 
 WulfPeak uses a compact samplesheet and exact, non-recursive FASTQ discovery.
-The v0.2.0 execution foundation supports paired-end (default) and single-end
-input validation, full preflight, deterministic dry-run command plans, status
-inspection, and output-manifest validation.
-
-This implementation slice intentionally does not execute analysis commands.
-Use `wulfpeak run --dry-run`; FastQC through reporting execution is added in
-the next implementation PRs.
+The v0.2.0 implementation supports paired-end (default) and single-end input
+validation, deterministic command plans, status inspection, conservative
+resume, and real per-sample execution through normalized bigWig coverage.
 
 ## Samplesheet
 
@@ -98,9 +94,10 @@ Downstream steps consume these manifest paths rather than reconstructing names.
 
 ## Validate and plan a run
 
-The analysis executables must already be on `PATH`: FastQC, Trim Galore,
-Bowtie2, samtools, deepTools `bamCoverage`, MACS3, bedtools, and MultiQC.
-WulfPeak does not install tools or load environment modules.
+The executables required for real execution through coverage must already be
+on `PATH`: FastQC, Trim Galore, Bowtie2, samtools, and deepTools
+`bamCoverage`. A complete dry-run plan additionally requires MACS3, bedtools,
+and MultiQC. WulfPeak does not install tools or load environment modules.
 
 ```console
 wulfpeak run \
@@ -137,6 +134,41 @@ parent directory. The consensus plan normalizes each
 replicate to merged BED3, records strict-majority support, merges qualifying
 segments, and declares both the canonical BED3 and support TSV outputs.
 
+## Execute through coverage
+
+Omitting `--dry-run` executes these phases independently for each sample:
+
+```text
+fastqc_raw -> trim -> fastqc_trimmed -> align -> bam_process -> coverage
+```
+
+`--stop-after` defaults to `coverage` for a real run. This release accepts
+only that real execution boundary; a later stop such as `peak` fails before
+preflight. MACS3, pooled BAM, consensus, MultiQC, and reporting actions remain
+plan-only and are never executed by this slice.
+
+Each step writes into its owned temporary directory. All temporary artifacts
+must pass their declared validators before any artifact in the step is
+atomically promoted. FastQC HTML and ZIP files are promoted individually, so
+reruns retain their existing non-empty parent directories.
+
+Resume is enabled by default. A step is reused only when its prior state is
+`done`, its signature still matches the plan, tool provenance, options, and
+direct input fingerprints, every retained canonical output validates, and its
+upstream chain was also reusable. Use `--force-from PHASE` to rebuild that
+phase and everything after it, or `--no-resume` to rebuild all six phases.
+
+By default, WulfPeak removes the reproducible unsorted alignment BAM and
+samtools processing scratch BAMs after that sample completes coverage. These
+retired files are not required by `output_manifest.json`, and resume reuses
+their downstream validated BAM or regenerates alignment when BAM processing
+must rerun. Pass `--keep-intermediates` to retain the unsorted and scratch BAMs;
+the retained unsorted BAM is then included in the output manifest.
+
+A successful real run writes `output_manifest.json` only for artifacts through
+coverage, records `dry_run: false` and `completed_through: coverage` in run
+metadata, and sets the pipeline plus all six per-sample step states to `done`.
+
 ## Inspect state and outputs
 
 Status does not require FASTQ, index, or analysis tools:
@@ -147,8 +179,10 @@ wulfpeak status --output-dir WulfPeak_out --json
 ```
 
 `wulfpeak validate-outputs` validates an existing `output_manifest.json`
-without rerunning analysis. The complete kind-specific validator set is
-finished in the reporting/release PR.
+without rerunning analysis. Validation checks gzip FASTQ structure, FastQC
+HTML and ZIP integrity, final BAMs with `samtools quickcheck`, BAM indexes,
+non-empty QC text, and bigWig magic bytes. Because BAM validation is explicit,
+`samtools` must be available when a manifest contains BAM artifacts.
 
 ## Development
 

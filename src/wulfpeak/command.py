@@ -14,6 +14,10 @@ from pathlib import Path
 class CommandExecutionError(RuntimeError):
     """Raised when an external command exits unsuccessfully."""
 
+    def __init__(self, message: str, *, returncode: int | None = None):
+        super().__init__(message)
+        self.returncode = returncode
+
 
 @dataclass(frozen=True)
 class CommandResult:
@@ -90,7 +94,8 @@ class CommandRunner:
         )
         if completed.returncode != 0:
             raise CommandExecutionError(
-                f"Command failed with exit code {completed.returncode}; see {log}"
+                f"Command failed with exit code {completed.returncode}; see {log}",
+                returncode=completed.returncode,
             )
         return result
 
@@ -161,7 +166,9 @@ class CommandRunner:
                 ).encode("utf-8")
             )
         if any(code != 0 for code in returncodes):
+            first_failure = next(code for code in returncodes if code != 0)
             raise CommandExecutionError(
-                f"Pipeline failed with exit codes {returncodes}; see {log}"
+                f"Pipeline failed with exit codes {returncodes}; see {log}",
+                returncode=first_failure,
             )
         return returncodes

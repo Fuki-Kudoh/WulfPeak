@@ -1,20 +1,36 @@
-"""Execution-foundation orchestration; analysis execution arrives in PR 2/3."""
+"""Preflight, planning, and coverage-bound per-sample execution."""
 
 from __future__ import annotations
 
 import json
 import platform
+import shutil
 import socket
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
 from . import __version__
 from .atomic import atomic_write_json
-from .config import ConfigurationError, RunConfig
-from .manifest import write_run_manifest
+from .command import CommandExecutionError
+from .config import PHASES, ConfigurationError, RunConfig
+from .executor import StepExecutor, reset_step_temporary
+from .manifest import ResolvedSample, write_run_manifest
 from .plan import build_command_plan
 from .preflight import PreflightResult, run_preflight
-from .status import RunLock, write_pipeline_status
+from .signatures import canonical_signature, large_file_fingerprint
+from .status import (
+    RunLock,
+    StepState,
+    can_reuse_step,
+    write_pipeline_status,
+    write_step_state,
+)
+from .validators import validate_artifact
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _normalized_layout(value: object) -> str | None:
@@ -65,14 +81,274 @@ def _tool_metadata(result: PreflightResult) -> dict[str, object]:
     }
 
 
-def prepare_dry_run(config: RunConfig, argv: list[str]) -> tuple[Path, Path, Path]:
-    if not config.dry_run:
-        raise ConfigurationError(
-            "Analysis execution is intentionally not enabled in the execution-foundation PR; "
-            "use --dry-run to validate and write the complete command plan"
+def _metadata(
+    config: RunConfig,
+    result: PreflightResult,
+    argv: list[str],
+    plan_path: Path,
+    *,
+    started: str,
+    finished: str | None,
+    completed_through: str | None,
+) -> dict[str, object]:
+    return {
+        "started_at": started,
+        "updated_at": finished or _now(),
+        "finished_at": finished,
+        "argv": argv,
+        "cwd": str(Path.cwd()),
+        "wulfpeak_version": __version__,
+        "python_version": platform.python_version(),
+        "hostname": socket.gethostname(),
+        "options": config.normalized_options(),
+        "tools": _tool_metadata(result),
+        "command_plan": str(plan_path),
+        "dry_run": config.dry_run,
+        "resume": config.resume,
+        "completed_through": completed_through,
+        "warnings": list(result.warnings),
+    }
+
+
+def _read_states(output_dir: Path) -> dict[str, StepState]:
+    try:
+        payload = json.loads(
+            (output_dir / "status" / "state.json").read_text(encoding="utf-8")
         )
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    raw_states = payload.get("steps", {})
+    if not isinstance(raw_states, dict):
+        return {}
+    states: dict[str, StepState] = {}
+    for step_id, value in raw_states.items():
+        if not isinstance(step_id, str) or not isinstance(value, dict):
+            continue
+        try:
+            states[step_id] = StepState(
+                key=str(value["key"]),
+                status=str(value["status"]),
+                signature=(
+                    str(value["signature"])
+                    if value.get("signature") is not None
+                    else None
+                ),
+                started_at=value.get("started_at"),
+                finished_at=value.get("finished_at"),
+                exit_code=value.get("exit_code"),
+                log_path=value.get("log_path"),
+                output_ids=tuple(str(item) for item in value.get("output_ids", [])),
+                last_error=value.get("last_error"),
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    return states
+
+
+def _artifact_ids(step: dict[str, object]) -> tuple[str, ...]:
+    artifacts = step.get("artifacts", [])
+    return tuple(
+        f"{step['scope']}:{step['scope_id']}:{step['phase']}:{index}"
+        for index, _artifact in enumerate(artifacts)
+    )
+
+
+def _state_id(step: dict[str, object]) -> str:
+    return f"{step['scope']}:{step['scope_id']}:{step['phase']}"
+
+
+def _sample_inputs(
+    phase: str,
+    resolved: ResolvedSample,
+    config: RunConfig,
+    result: PreflightResult,
+) -> list[Path]:
+    if phase in {"fastqc_raw", "trim"}:
+        paths = [resolved.raw_fastq.r1, resolved.raw_fastq.r2]
+    elif phase in {"fastqc_trimmed", "align"}:
+        paths = [resolved.trimmed_fastq.r1, resolved.trimmed_fastq.r2]
+    elif phase == "bam_process":
+        # The unsorted BAM is a transient materialization of the align step.
+        # Its provenance is represented by the upstream step signature so it
+        # may be retired after downstream completion without breaking resume.
+        paths = []
+    elif phase == "coverage":
+        bam = config.output_dir / "bam" / f"{resolved.sample.sample_id}.final.bam"
+        paths = [bam, Path(str(bam) + ".bai")]
+    else:
+        paths = []
+    selected = [path for path in paths if path is not None]
+    if phase == "align":
+        selected.extend(result.index_files)
+    return selected
+
+
+def _step_signature(
+    step: dict[str, object],
+    resolved: ResolvedSample,
+    config: RunConfig,
+    result: PreflightResult,
+    *,
+    upstream_signature: str | None,
+) -> str:
+    inputs = _sample_inputs(str(step["phase"]), resolved, config, result)
+    fingerprints = [
+        (
+            large_file_fingerprint(path)
+            if path.is_file()
+            else {"path": str(path.resolve()), "missing": True}
+        )
+        for path in inputs
+    ]
+    return canonical_signature(
+        {
+            "signature_schema": 2,
+            "step": step,
+            "inputs": fingerprints,
+            "upstream_signature": upstream_signature,
+            "tools": _tool_metadata(result),
+        }
+    )
+
+
+def _outputs_valid(step: dict[str, object], *, samtools: Path) -> bool:
+    artifacts = step.get("artifacts")
+    if not isinstance(artifacts, list):
+        return False
+    return all(
+        isinstance(artifact, dict)
+        and validate_artifact(artifact, temporary=False, samtools=samtools).valid
+        for artifact in artifacts
+    )
+
+
+def _retired_alignment_can_resume(
+    *,
+    config: RunConfig,
+    result: PreflightResult,
+    resolved: ResolvedSample,
+    alignment_signature: str,
+    states: dict[str, StepState],
+    steps_by_phase: dict[str, dict[str, object]],
+    samtools: Path,
+    force_index: int | None,
+) -> bool:
+    """Require a reusable downstream BAM before accepting a retired align output."""
+
+    bam_step = steps_by_phase.get("bam_process")
+    if bam_step is None or not config.resume:
+        return False
+    if force_index is not None and PHASES.index("bam_process") >= force_index:
+        return False
+    bam_signature = _step_signature(
+        bam_step,
+        resolved,
+        config,
+        result,
+        upstream_signature=alignment_signature,
+    )
+    return can_reuse_step(
+        states.get(_state_id(bam_step)),
+        bam_signature,
+        outputs_valid=_outputs_valid(bam_step, samtools=samtools),
+    )
+
+
+def _cleanup_sample_intermediates(
+    config: RunConfig,
+    sample_id: str,
+    states: dict[str, StepState],
+) -> None:
+    """Retire reproducible BAM intermediates after successful coverage."""
+
+    unsorted = (
+        config.output_dir
+        / "intermediate"
+        / "alignment"
+        / f"{sample_id}.unsorted.bam"
+    )
+    unsorted.unlink(missing_ok=True)
+    bam_scratch = (
+        config.output_dir
+        / "intermediate"
+        / ".steps"
+        / "samples"
+        / sample_id
+        / "bam_process"
+    )
+    if bam_scratch.exists():
+        shutil.rmtree(bam_scratch)
+
+    align_id = f"sample:{sample_id}:align"
+    align_state = states.get(align_id)
+    if align_state is not None and align_state.status == "done":
+        retired_state = replace(align_state, output_ids=())
+        write_step_state(
+            config.output_dir,
+            retired_state,
+            scope="samples",
+            scope_id=sample_id,
+        )
+        states[align_id] = retired_state
+
+
+def _write_output_manifest(
+    config: RunConfig,
+    plan: dict[str, object],
+    *,
+    samtools: Path,
+    completed_through: str,
+) -> Path:
+    outputs: list[dict[str, object]] = []
+    for step in plan["steps"]:
+        if not isinstance(step, dict):
+            continue
+        if not config.keep_intermediates and step.get("phase") == "align":
+            continue
+        for output_id, artifact in zip(_artifact_ids(step), step["artifacts"]):
+            result = validate_artifact(artifact, temporary=False, samtools=samtools)
+            outputs.append(
+                {
+                    "id": output_id,
+                    "scope": step["scope"],
+                    "scope_id": step["scope_id"],
+                    "phase": step["phase"],
+                    "path": artifact["canonical_path"],
+                    "kind": artifact["kind"],
+                    "validator": artifact["validator"],
+                    "required": True,
+                    "expected": True,
+                    "exists": bool(result.checks.get("exists")),
+                    "validated": result.valid,
+                    "checks": result.checks,
+                    "warnings": list(result.warnings),
+                }
+            )
+    valid = all(bool(entry["validated"]) for entry in outputs)
+    payload = {
+        "schema_version": 2,
+        "generated_at": _now(),
+        "completed_through": completed_through,
+        "validated": valid,
+        "outputs": outputs,
+    }
+    path = atomic_write_json(config.output_dir / "output_manifest.json", payload)
+    if not valid:
+        raise CommandExecutionError(
+            f"Canonical output validation failed while writing {path}"
+        )
+    return path
+
+
+def prepare_run(config: RunConfig, argv: list[str]) -> tuple[Path, Path, Path]:
+    selected_stop = config.stop_after or (None if config.dry_run else "coverage")
+    if not config.dry_run and selected_stop != "coverage":
+        raise ConfigurationError(
+            "non-dry-run execution must resolve to --stop-after coverage"
+        )
+
     with RunLock(config.output_dir, argv):
-        started = datetime.now(timezone.utc).isoformat()
+        started = _now()
         result = run_preflight(config)
         ensure_manifest_compatible(config, result)
         manifest_path = write_run_manifest(
@@ -82,35 +358,226 @@ def prepare_dry_run(config: RunConfig, argv: list[str]) -> tuple[Path, Path, Pat
             list(result.index_files),
         )
         plan = build_command_plan(
-            config, result.resolved_samples, result.groups, result.tools
+            config,
+            result.resolved_samples,
+            result.groups,
+            result.tools,
+            stop_after=selected_stop,
         )
         plan_path = atomic_write_json(
             config.output_dir / "config" / "command_plan.json", plan
         )
-        finished = datetime.now(timezone.utc).isoformat()
-        metadata = {
-            "started_at": started,
-            "updated_at": finished,
-            "finished_at": finished,
-            "argv": argv,
-            "cwd": str(Path.cwd()),
-            "wulfpeak_version": __version__,
-            "python_version": platform.python_version(),
-            "hostname": socket.gethostname(),
-            "options": config.normalized_options(),
-            "tools": _tool_metadata(result),
-            "command_plan": str(plan_path),
-            "dry_run": True,
-            "resume": config.resume,
-            "warnings": list(result.warnings),
+        metadata_path = config.output_dir / "metadata" / "run_metadata.json"
+
+        if config.dry_run:
+            finished = _now()
+            atomic_write_json(
+                metadata_path,
+                _metadata(
+                    config,
+                    result,
+                    argv,
+                    plan_path,
+                    started=started,
+                    finished=finished,
+                    completed_through=None,
+                ),
+            )
+            state_path = config.output_dir / "status" / "state.json"
+            if not state_path.exists():
+                atomic_write_json(state_path, {"steps": {}})
+            pipeline_status = config.output_dir / "status" / "pipeline.status"
+            if not pipeline_status.exists():
+                write_pipeline_status(config.output_dir, "null")
+            return manifest_path, plan_path, metadata_path
+
+        samtools = result.tools["samtools"].path
+        executor = StepExecutor(samtools=samtools)
+        states = _read_states(config.output_dir)
+        resolved_by_id = {
+            sample.sample.sample_id: sample for sample in result.resolved_samples
         }
-        metadata_path = atomic_write_json(
-            config.output_dir / "metadata" / "run_metadata.json", metadata
+        chain_unchanged = {
+            sample.sample.sample_id: True for sample in result.resolved_samples
+        }
+        upstream_signatures: dict[str, str | None] = {
+            sample.sample.sample_id: None for sample in result.resolved_samples
+        }
+        steps_by_sample: dict[str, dict[str, dict[str, object]]] = {
+            sample.sample.sample_id: {} for sample in result.resolved_samples
+        }
+        for planned_step in plan["steps"]:
+            if isinstance(planned_step, dict) and planned_step.get("scope") == "sample":
+                steps_by_sample[str(planned_step["scope_id"])][
+                    str(planned_step["phase"])
+                ] = planned_step
+        force_index = (
+            PHASES.index(config.force_from) if config.force_from is not None else None
         )
-        state_path = config.output_dir / "status" / "state.json"
-        if not state_path.exists():
-            atomic_write_json(state_path, {"steps": {}})
-        pipeline_status = config.output_dir / "status" / "pipeline.status"
-        if not pipeline_status.exists():
-            write_pipeline_status(config.output_dir, "null")
+        atomic_write_json(
+            metadata_path,
+            _metadata(
+                config,
+                result,
+                argv,
+                plan_path,
+                started=started,
+                finished=None,
+                completed_through=None,
+            ),
+        )
+        write_pipeline_status(config.output_dir, "running")
+        try:
+            for step in plan["steps"]:
+                if not isinstance(step, dict) or step.get("scope") != "sample":
+                    raise CommandExecutionError(
+                        "The coverage execution boundary only supports sample steps"
+                    )
+                sample_id = str(step["scope_id"])
+                phase = str(step["phase"])
+                resolved = resolved_by_id[sample_id]
+                signature = _step_signature(
+                    step,
+                    resolved,
+                    config,
+                    result,
+                    upstream_signature=upstream_signatures[sample_id],
+                )
+                log_path = (
+                    config.output_dir / "logs" / "samples" / sample_id / f"{phase}.log"
+                )
+                output_ids = _artifact_ids(step)
+                forced = force_index is not None and PHASES.index(phase) >= force_index
+                state = states.get(_state_id(step))
+                outputs_valid = _outputs_valid(step, samtools=samtools)
+                if (
+                    phase == "align"
+                    and not config.keep_intermediates
+                    and state is not None
+                    and state.status == "done"
+                    and not state.output_ids
+                ):
+                    outputs_valid = _retired_alignment_can_resume(
+                        config=config,
+                        result=result,
+                        resolved=resolved,
+                        alignment_signature=signature,
+                        states=states,
+                        steps_by_phase=steps_by_sample[sample_id],
+                        samtools=samtools,
+                        force_index=force_index,
+                    )
+                reusable = (
+                    config.resume
+                    and not forced
+                    and can_reuse_step(
+                        state,
+                        signature,
+                        outputs_valid=outputs_valid,
+                        upstream_reusable=chain_unchanged[sample_id],
+                    )
+                )
+                if reusable:
+                    upstream_signatures[sample_id] = signature
+                    if phase == "coverage" and not config.keep_intermediates:
+                        _cleanup_sample_intermediates(config, sample_id, states)
+                    continue
+
+                chain_unchanged[sample_id] = False
+                reset_step_temporary(config.output_dir, step)
+                step_started = _now()
+                running = StepState(
+                    phase,
+                    "running",
+                    signature=signature,
+                    started_at=step_started,
+                    log_path=str(log_path),
+                    output_ids=output_ids,
+                )
+                write_step_state(
+                    config.output_dir, running, scope="samples", scope_id=sample_id
+                )
+                try:
+                    executor.execute(step, log_path)
+                except BaseException as exc:
+                    failed = StepState(
+                        phase,
+                        "failed",
+                        signature=signature,
+                        started_at=step_started,
+                        finished_at=_now(),
+                        exit_code=(
+                            exc.returncode
+                            if isinstance(exc, CommandExecutionError)
+                            and exc.returncode is not None
+                            else 1
+                        ),
+                        log_path=str(log_path),
+                        output_ids=output_ids,
+                        last_error=str(exc),
+                    )
+                    write_step_state(
+                        config.output_dir, failed, scope="samples", scope_id=sample_id
+                    )
+                    raise CommandExecutionError(
+                        f"Step {phase} failed for sample {sample_id}: {exc}"
+                    ) from exc
+                done = StepState(
+                    phase,
+                    "done",
+                    signature=signature,
+                    started_at=step_started,
+                    finished_at=_now(),
+                    exit_code=0,
+                    log_path=str(log_path),
+                    output_ids=output_ids,
+                )
+                write_step_state(
+                    config.output_dir, done, scope="samples", scope_id=sample_id
+                )
+                states[_state_id(step)] = done
+                upstream_signatures[sample_id] = signature
+                if phase == "coverage" and not config.keep_intermediates:
+                    _cleanup_sample_intermediates(config, sample_id, states)
+
+            _write_output_manifest(
+                config, plan, samtools=samtools, completed_through="coverage"
+            )
+        except BaseException:
+            failed_at = _now()
+            write_pipeline_status(config.output_dir, "failed")
+            atomic_write_json(
+                metadata_path,
+                _metadata(
+                    config,
+                    result,
+                    argv,
+                    plan_path,
+                    started=started,
+                    finished=failed_at,
+                    completed_through=None,
+                ),
+            )
+            raise
+
+        finished = _now()
+        write_pipeline_status(config.output_dir, "done")
+        atomic_write_json(
+            metadata_path,
+            _metadata(
+                config,
+                result,
+                argv,
+                plan_path,
+                started=started,
+                finished=finished,
+                completed_through="coverage",
+            ),
+        )
         return manifest_path, plan_path, metadata_path
+
+
+def prepare_dry_run(config: RunConfig, argv: list[str]) -> tuple[Path, Path, Path]:
+    """Backward-compatible entrypoint now used for both dry and real runs."""
+
+    return prepare_run(config, argv)

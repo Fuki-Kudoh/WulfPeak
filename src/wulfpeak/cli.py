@@ -70,7 +70,7 @@ def _build_parser() -> argparse.ArgumentParser:
     check.set_defaults(func=_run_check)
 
     run = subparsers.add_parser(
-        "run", help="preflight and run (execution foundation: dry-run)"
+        "run", help="preflight and execute per-sample steps through coverage"
     )
     _add_common_inputs(run)
     run.add_argument("--assay", required=True, choices=[item.value for item in Assay])
@@ -89,6 +89,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--dry-run", action="store_true")
     run.add_argument("--no-resume", action="store_true")
     run.add_argument("--force-from", choices=PHASES)
+    run.add_argument("--stop-after", choices=PHASES)
     run.set_defaults(func=_run_pipeline)
 
     status = subparsers.add_parser(
@@ -147,6 +148,7 @@ def _run_check(args: argparse.Namespace) -> int:
 
 
 def _run_pipeline(args: argparse.Namespace) -> int:
+    resolved_stop_after = args.stop_after or (None if args.dry_run else "coverage")
     config = RunConfig(
         samplesheet=Path(args.samplesheet).expanduser().resolve(),
         fastq_dir=Path(args.fastq_dir).expanduser().resolve(),
@@ -170,9 +172,13 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         dry_run=args.dry_run,
         resume=not args.no_resume,
         force_from=args.force_from,
+        stop_after=resolved_stop_after,
     )
     manifest, plan, metadata = prepare_dry_run(config, args._argv)
-    print("WulfPeak dry-run preflight passed; no analysis commands were executed")
+    if config.dry_run:
+        print("WulfPeak dry-run preflight passed; no analysis commands were executed")
+    else:
+        print("WulfPeak execution completed through coverage")
     print(f"Manifest: {manifest}\nCommand plan: {plan}\nRun metadata: {metadata}")
     return 0
 

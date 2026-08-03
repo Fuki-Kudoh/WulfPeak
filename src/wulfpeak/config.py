@@ -22,6 +22,8 @@ PHASES = (
     "report",
 )
 
+IMPLEMENTED_PHASES = PHASES[: PHASES.index("coverage") + 1]
+
 
 class ConfigurationError(ValueError):
     """Raised for invalid or unsupported run configuration."""
@@ -49,6 +51,7 @@ class RunConfig:
     dry_run: bool = False
     resume: bool = True
     force_from: str | None = None
+    stop_after: str | None = None
 
     def __post_init__(self) -> None:
         errors: list[str] = []
@@ -72,6 +75,31 @@ class RunConfig:
             errors.append("--allow-dovetail is only applicable to paired-end runs")
         if self.force_from is not None and self.force_from not in PHASES:
             errors.append(f"unknown --force-from phase: {self.force_from}")
+        if self.stop_after is not None and self.stop_after not in PHASES:
+            errors.append(f"unknown --stop-after phase: {self.stop_after}")
+        if (
+            not self.dry_run
+            and self.stop_after is not None
+            and self.stop_after != "coverage"
+        ):
+            if self.stop_after in IMPLEMENTED_PHASES:
+                errors.append(
+                    "non-dry-run execution in this release must stop after coverage"
+                )
+            else:
+                errors.append(
+                    f"--stop-after {self.stop_after} is beyond the implemented "
+                    "execution boundary (coverage)"
+                )
+        if (
+            not self.dry_run
+            and self.force_from is not None
+            and self.force_from not in IMPLEMENTED_PHASES
+        ):
+            errors.append(
+                f"--force-from {self.force_from} is beyond the implemented "
+                "execution boundary (coverage)"
+            )
         if errors:
             raise ConfigurationError("Run configuration failed:\n" + "\n".join(
                 f"  - {error}" for error in errors
