@@ -236,6 +236,18 @@ def tool_counts(counter: Path) -> dict[str, int]:
     return counts
 
 
+def samtools_analysis_calls(counter: Path) -> int:
+    if not counter.exists():
+        return 0
+    validation_commands = {"quickcheck", "idxstats"}
+    return sum(
+        1
+        for line in counter.read_text(encoding="utf-8").splitlines()
+        if line.startswith("samtools\t")
+        and line.split("\t", 1)[1].split(" ", 1)[0] not in validation_commands
+    )
+
+
 class ExecutionTests(unittest.TestCase):
     def test_single_end_executes_through_coverage(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -259,9 +271,25 @@ class ExecutionTests(unittest.TestCase):
             self.assertTrue(manifest["validated"])
             self.assertEqual(manifest["completed_through"], "coverage")
             self.assertEqual({item["phase"] for item in manifest["outputs"]}, {
-                "fastqc_raw", "trim", "fastqc_trimmed", "align", "bam_process", "coverage"
+                "fastqc_raw", "trim", "fastqc_trimmed", "bam_process", "coverage"
             })
             self.assertTrue((output / "bigwig" / "sample_01.normalized.bw").is_file())
+            self.assertFalse(
+                (output / "intermediate" / "alignment" / "sample_01.unsorted.bam").exists()
+            )
+            self.assertFalse(
+                (
+                    output
+                    / "intermediate"
+                    / ".steps"
+                    / "samples"
+                    / "sample_01"
+                    / "bam_process"
+                ).exists()
+            )
+            self.assertEqual(
+                state["steps"]["sample:sample_01:align"]["output_ids"], []
+            )
             selected_path = f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}"
             with environment(PATH=selected_path), contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(
@@ -340,12 +368,14 @@ class ExecutionTests(unittest.TestCase):
             counter = root / "calls.log"
             self.assertEqual(run_with_tools(args, fake_bin, counter=counter)[0], 0)
             first = tool_counts(counter)
+            first_samtools_analysis = samtools_analysis_calls(counter)
             self.assertEqual(run_with_tools(args, fake_bin, counter=counter)[0], 0)
             resumed = tool_counts(counter)
             for tool in ("fastqc", "trim_galore", "bowtie2", "bamCoverage"):
                 self.assertEqual(resumed[tool], first[tool])
-            # Resume still validates the final BAM and index conservatively.
-            self.assertEqual(resumed["samtools"], first["samtools"] + 4)
+            self.assertEqual(
+                samtools_analysis_calls(counter), first_samtools_analysis
+            )
             write_fastq(root / "fastq" / "library_01.fastq.gz", records=2)
             self.assertEqual(run_with_tools(args, fake_bin, counter=counter)[0], 0)
             rebuilt = tool_counts(counter)
@@ -369,11 +399,50 @@ class ExecutionTests(unittest.TestCase):
             self.assertGreater(forced["bowtie2"], first["bowtie2"])
             self.assertGreater(forced["bamCoverage"], first["bamCoverage"])
             self.assertEqual(
+                run_with_tools(
+                    [*args, "--force-from", "bam_process"],
+                    fake_bin,
+                    counter=counter,
+                )[0],
+                0,
+            )
+            forced_bam = tool_counts(counter)
+            self.assertEqual(forced_bam["fastqc"], forced["fastqc"])
+            self.assertEqual(forced_bam["trim_galore"], forced["trim_galore"])
+            self.assertGreater(forced_bam["bowtie2"], forced["bowtie2"])
+            self.assertGreater(forced_bam["bamCoverage"], forced["bamCoverage"])
+            self.assertEqual(
                 run_with_tools([*args, "--no-resume"], fake_bin, counter=counter)[0], 0
             )
             no_resume = tool_counts(counter)
-            self.assertGreater(no_resume["fastqc"], forced["fastqc"])
-            self.assertGreater(no_resume["trim_galore"], forced["trim_galore"])
+            self.assertGreater(no_resume["fastqc"], forced_bam["fastqc"])
+            self.assertGreater(no_resume["trim_galore"], forced_bam["trim_galore"])
+
+    def test_missing_final_bam_rehydrates_retired_alignment(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args, fake_bin = prepare_run(root, paired=False)
+            counter = root / "calls.log"
+            self.assertEqual(run_with_tools(args, fake_bin, counter=counter)[0], 0)
+            initial = tool_counts(counter)
+            final_bam = root / "out" / "bam" / "sample_01.final.bam"
+            final_bam.unlink()
+
+            code, error = run_with_tools(args, fake_bin, counter=counter)
+            self.assertEqual(code, 0, error)
+            rebuilt = tool_counts(counter)
+            self.assertGreater(rebuilt["bowtie2"], initial["bowtie2"])
+            self.assertGreater(rebuilt["bamCoverage"], initial["bamCoverage"])
+            self.assertTrue(final_bam.is_file())
+            self.assertFalse(
+                (
+                    root
+                    / "out"
+                    / "intermediate"
+                    / "alignment"
+                    / "sample_01.unsorted.bam"
+                ).exists()
+            )
 
     def test_invalid_forced_coverage_preserves_previous_bigwig(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -381,6 +450,7 @@ class ExecutionTests(unittest.TestCase):
             args, fake_bin = prepare_run(root, paired=False)
             counter = root / "calls.log"
             self.assertEqual(run_with_tools(args, fake_bin, counter=counter)[0], 0)
+            initial = tool_counts(counter)
             bigwig = root / "out" / "bigwig" / "sample_01.normalized.bw"
             previous = bigwig.read_bytes()
             code, _error = run_with_tools(
@@ -391,6 +461,108 @@ class ExecutionTests(unittest.TestCase):
             )
             self.assertEqual(code, 3)
             self.assertEqual(bigwig.read_bytes(), previous)
+            self.assertEqual(tool_counts(counter)["bowtie2"], initial["bowtie2"])
+
+    def test_failed_coverage_retains_intermediates_until_success(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args, fake_bin = prepare_run(root, paired=False)
+            counter = root / "calls.log"
+            code, _error = run_with_tools(
+                args,
+                fake_bin,
+                counter=counter,
+                invalid="bamCoverage",
+            )
+            self.assertEqual(code, 3)
+            output = root / "out"
+            unsorted = output / "intermediate" / "alignment" / "sample_01.unsorted.bam"
+            scratch = (
+                output
+                / "intermediate"
+                / ".steps"
+                / "samples"
+                / "sample_01"
+                / "bam_process"
+            )
+            self.assertTrue(unsorted.is_file())
+            self.assertTrue((scratch / "marked.bam").is_file())
+
+            self.assertEqual(run_with_tools(args, fake_bin, counter=counter)[0], 0)
+            self.assertFalse(unsorted.exists())
+            self.assertFalse(scratch.exists())
+
+    def test_keep_intermediates_retains_bams_and_declares_unsorted_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args, fake_bin = prepare_run(root, paired=False)
+            counter = root / "calls.log"
+            self.assertEqual(
+                run_with_tools(
+                    [*args, "--keep-intermediates"], fake_bin, counter=counter
+                )[0],
+                0,
+            )
+            output = root / "out"
+            unsorted = output / "intermediate" / "alignment" / "sample_01.unsorted.bam"
+            self.assertTrue(unsorted.is_file())
+            scratch = (
+                output
+                / "intermediate"
+                / ".steps"
+                / "samples"
+                / "sample_01"
+                / "bam_process"
+            )
+            self.assertEqual(
+                {
+                    path.name
+                    for path in scratch.iterdir()
+                    if path.suffix == ".bam"
+                },
+                {"name-collated.bam", "fixmate.bam", "coordinate.bam", "marked.bam"},
+            )
+            manifest = json.loads((output / "output_manifest.json").read_text())
+            align_outputs = [
+                entry for entry in manifest["outputs"] if entry["phase"] == "align"
+            ]
+            self.assertEqual(len(align_outputs), 1)
+            self.assertEqual(Path(align_outputs[0]["path"]).resolve(), unsorted.resolve())
+
+            analysis_calls = {
+                tool: tool_counts(counter)[tool]
+                for tool in ("fastqc", "trim_galore", "bowtie2", "bamCoverage")
+            }
+            samtools_calls = samtools_analysis_calls(counter)
+            self.assertEqual(
+                run_with_tools(
+                    [*args, "--keep-intermediates"], fake_bin, counter=counter
+                )[0],
+                0,
+            )
+            self.assertEqual(
+                {
+                    tool: tool_counts(counter)[tool]
+                    for tool in ("fastqc", "trim_galore", "bowtie2", "bamCoverage")
+                },
+                analysis_calls,
+            )
+            self.assertEqual(samtools_analysis_calls(counter), samtools_calls)
+
+            self.assertEqual(run_with_tools(args, fake_bin, counter=counter)[0], 0)
+            self.assertEqual(
+                {
+                    tool: tool_counts(counter)[tool]
+                    for tool in ("fastqc", "trim_galore", "bowtie2", "bamCoverage")
+                },
+                analysis_calls,
+            )
+            self.assertFalse(unsorted.exists())
+            self.assertFalse(scratch.exists())
+            manifest = json.loads((output / "output_manifest.json").read_text())
+            self.assertNotIn(
+                "align", {entry["phase"] for entry in manifest["outputs"]}
+            )
 
 
 if __name__ == "__main__":

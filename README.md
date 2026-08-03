@@ -154,9 +154,16 @@ reruns retain their existing non-empty parent directories.
 
 Resume is enabled by default. A step is reused only when its prior state is
 `done`, its signature still matches the plan, tool provenance, options, and
-direct input fingerprints, every canonical output validates, and its upstream
-chain was also reusable. Use `--force-from PHASE` to rebuild that phase and
-everything after it, or `--no-resume` to rebuild all six phases.
+direct input fingerprints, every retained canonical output validates, and its
+upstream chain was also reusable. Use `--force-from PHASE` to rebuild that
+phase and everything after it, or `--no-resume` to rebuild all six phases.
+
+By default, WulfPeak removes the reproducible unsorted alignment BAM and
+samtools processing scratch BAMs after that sample completes coverage. These
+retired files are not required by `output_manifest.json`, and resume reuses
+their downstream validated BAM or regenerates alignment when BAM processing
+must rerun. Pass `--keep-intermediates` to retain the unsorted and scratch BAMs;
+the retained unsorted BAM is then included in the output manifest.
 
 A successful real run writes `output_manifest.json` only for artifacts through
 coverage, records `dry_run: false` and `completed_through: coverage` in run

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import platform
+import shutil
 import socket
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -166,12 +168,10 @@ def _sample_inputs(
     elif phase in {"fastqc_trimmed", "align"}:
         paths = [resolved.trimmed_fastq.r1, resolved.trimmed_fastq.r2]
     elif phase == "bam_process":
-        paths = [
-            config.output_dir
-            / "intermediate"
-            / "alignment"
-            / f"{resolved.sample.sample_id}.unsorted.bam"
-        ]
+        # The unsorted BAM is a transient materialization of the align step.
+        # Its provenance is represented by the upstream step signature so it
+        # may be retired after downstream completion without breaking resume.
+        paths = []
     elif phase == "coverage":
         bam = config.output_dir / "bam" / f"{resolved.sample.sample_id}.final.bam"
         paths = [bam, Path(str(bam) + ".bai")]
@@ -188,14 +188,24 @@ def _step_signature(
     resolved: ResolvedSample,
     config: RunConfig,
     result: PreflightResult,
+    *,
+    upstream_signature: str | None,
 ) -> str:
     inputs = _sample_inputs(str(step["phase"]), resolved, config, result)
-    fingerprints = [large_file_fingerprint(path) for path in inputs]
+    fingerprints = [
+        (
+            large_file_fingerprint(path)
+            if path.is_file()
+            else {"path": str(path.resolve()), "missing": True}
+        )
+        for path in inputs
+    ]
     return canonical_signature(
         {
-            "signature_schema": 1,
+            "signature_schema": 2,
             "step": step,
             "inputs": fingerprints,
+            "upstream_signature": upstream_signature,
             "tools": _tool_metadata(result),
         }
     )
@@ -212,6 +222,76 @@ def _outputs_valid(step: dict[str, object], *, samtools: Path) -> bool:
     )
 
 
+def _retired_alignment_can_resume(
+    *,
+    config: RunConfig,
+    result: PreflightResult,
+    resolved: ResolvedSample,
+    alignment_signature: str,
+    states: dict[str, StepState],
+    steps_by_phase: dict[str, dict[str, object]],
+    samtools: Path,
+    force_index: int | None,
+) -> bool:
+    """Require a reusable downstream BAM before accepting a retired align output."""
+
+    bam_step = steps_by_phase.get("bam_process")
+    if bam_step is None or not config.resume:
+        return False
+    if force_index is not None and PHASES.index("bam_process") >= force_index:
+        return False
+    bam_signature = _step_signature(
+        bam_step,
+        resolved,
+        config,
+        result,
+        upstream_signature=alignment_signature,
+    )
+    return can_reuse_step(
+        states.get(_state_id(bam_step)),
+        bam_signature,
+        outputs_valid=_outputs_valid(bam_step, samtools=samtools),
+    )
+
+
+def _cleanup_sample_intermediates(
+    config: RunConfig,
+    sample_id: str,
+    states: dict[str, StepState],
+) -> None:
+    """Retire reproducible BAM intermediates after successful coverage."""
+
+    unsorted = (
+        config.output_dir
+        / "intermediate"
+        / "alignment"
+        / f"{sample_id}.unsorted.bam"
+    )
+    unsorted.unlink(missing_ok=True)
+    bam_scratch = (
+        config.output_dir
+        / "intermediate"
+        / ".steps"
+        / "samples"
+        / sample_id
+        / "bam_process"
+    )
+    if bam_scratch.exists():
+        shutil.rmtree(bam_scratch)
+
+    align_id = f"sample:{sample_id}:align"
+    align_state = states.get(align_id)
+    if align_state is not None and align_state.status == "done":
+        retired_state = replace(align_state, output_ids=())
+        write_step_state(
+            config.output_dir,
+            retired_state,
+            scope="samples",
+            scope_id=sample_id,
+        )
+        states[align_id] = retired_state
+
+
 def _write_output_manifest(
     config: RunConfig,
     plan: dict[str, object],
@@ -222,6 +302,8 @@ def _write_output_manifest(
     outputs: list[dict[str, object]] = []
     for step in plan["steps"]:
         if not isinstance(step, dict):
+            continue
+        if not config.keep_intermediates and step.get("phase") == "align":
             continue
         for output_id, artifact in zip(_artifact_ids(step), step["artifacts"]):
             result = validate_artifact(artifact, temporary=False, samtools=samtools)
@@ -318,6 +400,17 @@ def prepare_run(config: RunConfig, argv: list[str]) -> tuple[Path, Path, Path]:
         chain_unchanged = {
             sample.sample.sample_id: True for sample in result.resolved_samples
         }
+        upstream_signatures: dict[str, str | None] = {
+            sample.sample.sample_id: None for sample in result.resolved_samples
+        }
+        steps_by_sample: dict[str, dict[str, dict[str, object]]] = {
+            sample.sample.sample_id: {} for sample in result.resolved_samples
+        }
+        for planned_step in plan["steps"]:
+            if isinstance(planned_step, dict) and planned_step.get("scope") == "sample":
+                steps_by_sample[str(planned_step["scope_id"])][
+                    str(planned_step["phase"])
+                ] = planned_step
         force_index = (
             PHASES.index(config.force_from) if config.force_from is not None else None
         )
@@ -343,23 +436,51 @@ def prepare_run(config: RunConfig, argv: list[str]) -> tuple[Path, Path, Path]:
                 sample_id = str(step["scope_id"])
                 phase = str(step["phase"])
                 resolved = resolved_by_id[sample_id]
-                signature = _step_signature(step, resolved, config, result)
+                signature = _step_signature(
+                    step,
+                    resolved,
+                    config,
+                    result,
+                    upstream_signature=upstream_signatures[sample_id],
+                )
                 log_path = (
                     config.output_dir / "logs" / "samples" / sample_id / f"{phase}.log"
                 )
                 output_ids = _artifact_ids(step)
                 forced = force_index is not None and PHASES.index(phase) >= force_index
+                state = states.get(_state_id(step))
+                outputs_valid = _outputs_valid(step, samtools=samtools)
+                if (
+                    phase == "align"
+                    and not config.keep_intermediates
+                    and state is not None
+                    and state.status == "done"
+                    and not state.output_ids
+                ):
+                    outputs_valid = _retired_alignment_can_resume(
+                        config=config,
+                        result=result,
+                        resolved=resolved,
+                        alignment_signature=signature,
+                        states=states,
+                        steps_by_phase=steps_by_sample[sample_id],
+                        samtools=samtools,
+                        force_index=force_index,
+                    )
                 reusable = (
                     config.resume
                     and not forced
                     and can_reuse_step(
-                        states.get(_state_id(step)),
+                        state,
                         signature,
-                        outputs_valid=_outputs_valid(step, samtools=samtools),
+                        outputs_valid=outputs_valid,
                         upstream_reusable=chain_unchanged[sample_id],
                     )
                 )
                 if reusable:
+                    upstream_signatures[sample_id] = signature
+                    if phase == "coverage" and not config.keep_intermediates:
+                        _cleanup_sample_intermediates(config, sample_id, states)
                     continue
 
                 chain_unchanged[sample_id] = False
@@ -415,6 +536,9 @@ def prepare_run(config: RunConfig, argv: list[str]) -> tuple[Path, Path, Path]:
                     config.output_dir, done, scope="samples", scope_id=sample_id
                 )
                 states[_state_id(step)] = done
+                upstream_signatures[sample_id] = signature
+                if phase == "coverage" and not config.keep_intermediates:
+                    _cleanup_sample_intermediates(config, sample_id, states)
 
             _write_output_manifest(
                 config, plan, samtools=samtools, completed_through="coverage"
