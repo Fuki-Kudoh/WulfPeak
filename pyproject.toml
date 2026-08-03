@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "wulfpeak"
 version = "0.1.0"
-description = "A strict, reproducible paired-end peak-calling workflow"
+description = "A strict, resumable ChIP-seq and CUT&Tag peak-calling workflow"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}

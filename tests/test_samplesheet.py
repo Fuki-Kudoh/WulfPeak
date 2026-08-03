@@ -244,7 +244,9 @@ class SamplesheetTests(unittest.TestCase):
         rows = valid_rows()
         rows[0]["control"] = "unknown"
         write_sheet(self.sheet, rows)
-        with self.assertRaisesRegex(SamplesheetValidationError, "must match an existing sample_id"):
+        with self.assertRaisesRegex(
+            SamplesheetValidationError, "must match an existing sample_id"
+        ):
             load_samplesheet(self.sheet)
 
     def test_peak_control_may_be_dot(self) -> None:
@@ -252,6 +254,40 @@ class SamplesheetTests(unittest.TestCase):
         rows[0]["control"] = "."
         write_sheet(self.sheet, rows)
         self.assertEqual(len(load_samplesheet(self.sheet)), 2)
+
+    def test_group_requires_one_control(self) -> None:
+        rows = valid_rows()
+        rows.insert(
+            1,
+            {
+                "input_id": "treat_raw_02",
+                "sample_id": "treat_rep2",
+                "group_id": "factor_A",
+                "peak_type": "narrow",
+                "control": ".",
+                "qvalue": "0.01",
+            },
+        )
+        rows[0]["group_id"] = "factor_A"
+        write_sheet(self.sheet, rows)
+        with self.assertRaisesRegex(
+            SamplesheetValidationError, "must use the same control"
+        ):
+            load_samplesheet(self.sheet)
+
+    def test_sample_and_group_ids_are_path_safe(self) -> None:
+        for field, value in (
+            ("sample_id", "../escape"),
+            ("sample_id", "."),
+            ("group_id", "nested/group"),
+            ("group_id", " group"),
+        ):
+            with self.subTest(field=field, value=value):
+                rows = valid_rows()
+                rows[0][field] = value
+                write_sheet(self.sheet, rows)
+                with self.assertRaises(SamplesheetValidationError):
+                    load_samplesheet(self.sheet)
 
 
 if __name__ == "__main__":

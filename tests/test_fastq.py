@@ -8,8 +8,10 @@ from wulfpeak.fastq import (
     AmbiguousFastqError,
     FastqNotFoundError,
     FastqPairMismatchError,
+    discover_fastq_input,
     discover_fastq_pair,
 )
+from wulfpeak.models import ReadLayout
 
 
 SUPPORTED_PAIRS = (
@@ -21,8 +23,55 @@ SUPPORTED_PAIRS = (
     ("_1.fq.gz", "_2.fq.gz"),
 )
 
+SUPPORTED_SINGLE = (
+    ".fastq.gz",
+    ".fq.gz",
+    "_R1.fastq.gz",
+    "_R1.fq.gz",
+    "_R1_001.fastq.gz",
+    "_R1_001.fq.gz",
+    "_1.fastq.gz",
+    "_1.fq.gz",
+)
+
 
 class FastqDiscoveryTests(unittest.TestCase):
+    def test_discovers_each_supported_single_end_name(self) -> None:
+        for suffix in SUPPORTED_SINGLE:
+            with self.subTest(suffix=suffix), tempfile.TemporaryDirectory() as temporary:
+                fastq_dir = Path(temporary)
+                expected = fastq_dir / f"library{suffix}"
+                expected.touch()
+
+                resolved = discover_fastq_input(
+                    "library", fastq_dir, ReadLayout.SINGLE_END
+                )
+
+                self.assertEqual(resolved.r1, expected.resolve())
+                self.assertIsNone(resolved.r2)
+                self.assertEqual(resolved.layout, ReadLayout.SINGLE_END)
+
+    def test_single_end_rejects_multiple_supported_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fastq_dir = Path(temporary)
+            (fastq_dir / "library.fastq.gz").touch()
+            (fastq_dir / "library_R1.fastq.gz").touch()
+            with self.assertRaisesRegex(AmbiguousFastqError, "will not guess"):
+                discover_fastq_input("library", fastq_dir, ReadLayout.SINGLE_END)
+
+    def test_single_end_rejects_r2_instead_of_ignoring_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fastq_dir = Path(temporary)
+            (fastq_dir / "library.fastq.gz").touch()
+            (fastq_dir / "library_R2.fastq.gz").touch()
+            with self.assertRaisesRegex(FastqPairMismatchError, "will not ignore"):
+                discover_fastq_input("library", fastq_dir, ReadLayout.SINGLE_END)
+
+    def test_single_end_reports_missing_input(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(FastqNotFoundError, "No single-end FASTQ"):
+                discover_fastq_input("missing", temporary, ReadLayout.SINGLE_END)
+
     def test_discovers_each_supported_pair(self) -> None:
         for r1_suffix, r2_suffix in SUPPORTED_PAIRS:
             with self.subTest(r1_suffix=r1_suffix, r2_suffix=r2_suffix):
