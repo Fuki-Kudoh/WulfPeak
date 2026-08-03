@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 
@@ -35,6 +36,8 @@ def artifact_contract(
     *,
     validator: str,
 ) -> dict[str, object]:
+    if kind == "directory":
+        raise ValueError("directory artifacts are not atomically replaceable")
     temporary = Path(temporary_path)
     canonical = Path(canonical_path)
     if temporary == canonical:
@@ -44,5 +47,23 @@ def artifact_contract(
         "temporary_path": str(temporary),
         "canonical_path": str(canonical),
         "validator": validator,
-        "promotion": "validate_then_atomic_replace",
+        "promotion": "validate_then_atomic_file_replace",
     }
+
+
+def promote_file_artifact(
+    artifact: dict[str, object], *, validated: bool
+) -> Path:
+    """Promote one validated file without replacing its non-empty parent."""
+
+    if not validated:
+        raise ValueError("artifact must validate before promotion")
+    if artifact.get("promotion") != "validate_then_atomic_file_replace":
+        raise ValueError("unsupported artifact promotion contract")
+    temporary = Path(str(artifact["temporary_path"]))
+    canonical = Path(str(artifact["canonical_path"]))
+    if not temporary.is_file():
+        raise ValueError(f"temporary artifact is not a regular file: {temporary}")
+    canonical.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(temporary, canonical)
+    return canonical

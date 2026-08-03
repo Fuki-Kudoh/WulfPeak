@@ -184,6 +184,24 @@ class RunCliTests(unittest.TestCase):
             peak_argv = command_argvs(peak)[0]
             self.assertIn("BAMPE", peak_argv)
             self.assertIn("-c", peak_argv)
+            for phase in ("fastqc_raw", "fastqc_trimmed"):
+                fastqc_step = next(
+                    step for step in plan["steps"] if step["phase"] == phase
+                )
+                self.assertEqual(len(fastqc_step["artifacts"]), 4)
+                self.assertEqual(
+                    {artifact["kind"] for artifact in fastqc_step["artifacts"]},
+                    {"html", "zip"},
+                )
+            raw_macs_artifacts = [
+                artifact
+                for artifact in peak["artifacts"]
+                if Path(artifact["canonical_path"]).parent.name == "macs3"
+            ]
+            self.assertEqual(len(raw_macs_artifacts), 3)
+            self.assertNotIn(
+                "directory", {artifact["kind"] for artifact in peak["artifacts"]}
+            )
             self.assertEqual(
                 len(
                     [
@@ -214,7 +232,8 @@ class RunCliTests(unittest.TestCase):
                         artifact["temporary_path"], artifact["canonical_path"]
                     )
                     self.assertEqual(
-                        artifact["promotion"], "validate_then_atomic_replace"
+                        artifact["promotion"],
+                        "validate_then_atomic_file_replace",
                     )
             consensus = next(
                 step for step in plan["steps"] if step["phase"] == "consensus_peak"

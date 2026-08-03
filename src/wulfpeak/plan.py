@@ -24,6 +24,36 @@ def _step_tmp(output: Path, scope: str, scope_id: str, phase: str) -> Path:
     return output / "intermediate" / ".steps" / scope / scope_id / phase
 
 
+def _fastqc_basename(read: str | Path) -> str:
+    name = Path(read).name
+    for suffix in (".fastq.gz", ".fq.gz", ".fastq", ".fq"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    raise ValueError(f"unsupported FASTQ filename in command plan: {name}")
+
+
+def _fastqc_artifacts(
+    reads: list[str], temporary_dir: Path, canonical_dir: Path
+) -> list[dict[str, object]]:
+    artifacts: list[dict[str, object]] = []
+    for read in reads:
+        basename = _fastqc_basename(read)
+        for extension, kind, validator in (
+            ("html", "html", "html_nonempty"),
+            ("zip", "zip", "zip_nonempty"),
+        ):
+            filename = f"{basename}_fastqc.{extension}"
+            artifacts.append(
+                artifact_contract(
+                    kind,
+                    temporary_dir / filename,
+                    canonical_dir / filename,
+                    validator=validator,
+                )
+            )
+    return artifacts
+
+
 def _record(
     phase: str,
     scope: str,
@@ -119,20 +149,35 @@ def _peak_plan(
                 write_mode="atomic_replace",
             )
         )
+    raw_output_specs = [
+        (f"{name}_peaks.{extension}", extension, f"{extension}_or_empty"),
+        (f"{name}_peaks.xls", "text", "text_nonempty"),
+    ]
+    if peak_type == "broad":
+        raw_output_specs.append(
+            (f"{name}_peaks.gappedPeak", "gappedPeak", "gappedPeak_or_empty")
+        )
+    else:
+        raw_output_specs.append(
+            (f"{name}_summits.bed", "bed", "bed_or_empty")
+        )
     artifacts = [
         artifact_contract(
-            "directory",
-            macs_tmp,
-            canonical_root / "macs3",
-            validator="macs3_output_directory",
-        ),
+            kind,
+            macs_tmp / filename,
+            canonical_root / "macs3" / filename,
+            validator=validator,
+        )
+        for filename, kind, validator in raw_output_specs
+    ]
+    artifacts.append(
         artifact_contract(
             extension,
             canonical_peak_tmp,
             canonical_peak,
             validator=f"{extension}_or_empty",
-        ),
-    ]
+        )
+    )
     return actions, artifacts
 
 
@@ -175,14 +220,7 @@ def build_command_plan(
                         ]
                     )
                 ],
-                [
-                    artifact_contract(
-                        "directory",
-                        raw_qc_tmp,
-                        raw_qc,
-                        validator="fastqc_directory",
-                    )
-                ],
+                _fastqc_artifacts(raw_reads, raw_qc_tmp, raw_qc),
             )
         )
 
@@ -261,14 +299,7 @@ def build_command_plan(
                         ]
                     )
                 ],
-                [
-                    artifact_contract(
-                        "directory",
-                        trimmed_qc_tmp,
-                        trimmed_qc,
-                        validator="fastqc_directory",
-                    )
-                ],
+                _fastqc_artifacts(trimmed_reads, trimmed_qc_tmp, trimmed_qc),
             )
         )
 
@@ -701,7 +732,7 @@ def build_command_plan(
         "artifact_contract": {
             "command_outputs": "write temporary_path only",
             "validation": "run the declared validator on temporary_path",
-            "promotion": "os.replace temporary_path with canonical_path only after validation",
+            "promotion": "os.replace each validated file without replacing its parent directory",
             "failure": "never promote partial or invalid output",
         },
         "steps": steps,

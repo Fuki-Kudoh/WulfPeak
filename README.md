@@ -131,7 +131,9 @@ against an existing output directory preserves all completed and failed state.
 Each planned step has ordered `actions` and explicit `artifacts`. Commands that
 produce data on stdout declare an atomic `stdout_path`. Every artifact records
 a distinct step-temporary path, validator, canonical path, and
-`validate_then_atomic_replace` promotion. The consensus plan normalizes each
+`validate_then_atomic_file_replace` promotion. FastQC and MACS3 outputs are
+declared as individual files, so a forced rerun never replaces a non-empty
+parent directory. The consensus plan normalizes each
 replicate to merged BED3, records strict-majority support, merges qualifying
 segments, and declares both the canonical BED3 and support TSV outputs.
 

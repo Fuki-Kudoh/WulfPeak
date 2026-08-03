@@ -13,6 +13,7 @@ from wulfpeak.preflight import (
     validate_blacklist,
     validate_bowtie2_index,
 )
+from wulfpeak.plan_schema import artifact_contract, promote_file_artifact
 from wulfpeak.signatures import canonical_signature
 from wulfpeak.status import (
     LockConflictError,
@@ -183,8 +184,57 @@ class FoundationTests(unittest.TestCase):
                             artifact["temporary_path"], artifact["canonical_path"]
                         )
                         self.assertEqual(
-                            artifact["promotion"], "validate_then_atomic_replace"
+                            artifact["promotion"],
+                            "validate_then_atomic_file_replace",
                         )
+
+    def test_file_promotion_replaces_outputs_inside_nonempty_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for directory_name, filenames in (
+                ("fastqc_raw", ("read_fastqc.html", "read_fastqc.zip")),
+                ("fastqc_trimmed", ("trimmed_fastqc.html", "trimmed_fastqc.zip")),
+                ("macs3", ("factor_peaks.narrowPeak", "factor_peaks.xls")),
+            ):
+                with self.subTest(directory=directory_name):
+                    canonical_dir = root / "canonical" / directory_name
+                    temporary_dir = root / "temporary" / directory_name
+                    canonical_dir.mkdir(parents=True)
+                    temporary_dir.mkdir(parents=True)
+                    sentinel = canonical_dir / "unrelated.txt"
+                    sentinel.write_text("keep\n", encoding="utf-8")
+                    artifacts = []
+                    for filename in filenames:
+                        canonical = canonical_dir / filename
+                        temporary_file = temporary_dir / filename
+                        canonical.write_text("old\n", encoding="utf-8")
+                        temporary_file.write_text("new\n", encoding="utf-8")
+                        artifacts.append(
+                            artifact_contract(
+                                "file",
+                                temporary_file,
+                                canonical,
+                                validator="test",
+                            )
+                        )
+                    for artifact in artifacts:
+                        promote_file_artifact(artifact, validated=True)
+                    self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep\n")
+                    for filename in filenames:
+                        self.assertEqual(
+                            (canonical_dir / filename).read_text(encoding="utf-8"),
+                            "new\n",
+                        )
+                    self.assertEqual(list(temporary_dir.iterdir()), [])
+
+    def test_directory_artifacts_are_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "directory artifacts"):
+            artifact_contract(
+                "directory",
+                "/tmp/temporary",
+                "/tmp/canonical",
+                validator="directory",
+            )
 
     def test_resume_requires_done_signature_outputs_and_upstream(self) -> None:
         state = StepState("trim", "done", signature="abc")
