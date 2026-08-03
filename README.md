@@ -14,12 +14,16 @@ FASTQ files. Single-end reads are not supported in v0.1.0.
 | `group_id` | Non-empty replicate group used for consensus peaks and pooled BAM/peak generation. |
 | `peak_type` | `narrow`, `broad`, or `input`. |
 | `control` | Matched input's `sample_id`, or `.`. Input rows must use `.`. |
-| `qvalue` | Numeric MACS `callpeak -q` value. Input rows must use `.`. |
+| `qvalue` | Finite MACS `callpeak -q` value satisfying `0 < qvalue <= 1`. Input rows must use `.`. |
 
 See [the example samplesheet](examples/samples.tsv).
 
 The legacy `fastq1` and `fastq2` columns are not accepted. FASTQ paths are
 resolved from `input_id` instead.
+
+All non-input replicates sharing a `group_id` must use the same `peak_type` and
+numerically equivalent `qvalue`. Input rows do not participate in these group
+consistency checks.
 
 ## Check a run
 

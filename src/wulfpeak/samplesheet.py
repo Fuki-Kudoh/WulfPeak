@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import csv
-import math
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 
@@ -49,11 +49,12 @@ def _duplicates(values: list[str]) -> list[str]:
     return sorted(duplicates)
 
 
-def _is_numeric(value: str) -> bool:
+def _parse_qvalue(value: str) -> Decimal | None:
     try:
-        return math.isfinite(float(value))
-    except ValueError:
-        return False
+        qvalue = Decimal(value)
+    except InvalidOperation:
+        return None
+    return qvalue if qvalue.is_finite() else None
 
 
 def load_samplesheet(path: str | Path) -> list[Sample]:
@@ -115,10 +116,17 @@ def load_samplesheet(path: str | Path) -> list[Sample]:
             if qvalue != ".":
                 errors.append(f"row {row_number}: input samples must use qvalue='.'")
         elif peak_type in {"narrow", "broad"}:
-            if not _is_numeric(qvalue):
+            parsed_qvalue = _parse_qvalue(qvalue)
+            if parsed_qvalue is None:
                 errors.append(
-                    f"row {row_number}: qvalue must be numeric for {peak_type} samples; "
+                    f"row {row_number}: qvalue must be numeric and finite for "
+                    f"{peak_type} samples; "
                     f"got {qvalue!r}"
+                )
+            elif not Decimal("0") < parsed_qvalue <= Decimal("1"):
+                errors.append(
+                    f"row {row_number}: qvalue must satisfy 0 < qvalue <= 1 for "
+                    f"{peak_type} samples; got {qvalue!r}"
                 )
 
         samples.append(Sample(**values))
@@ -147,6 +155,38 @@ def load_samplesheet(path: str | Path) -> list[Sample]:
                     f"row {row_number}: control {sample.control!r} must match an "
                     "existing sample_id with peak_type=input, or be '.'"
                 )
+
+    non_input_groups: dict[str, list[Sample]] = {}
+    for sample in samples:
+        if sample.peak_type in {"narrow", "broad"}:
+            non_input_groups.setdefault(sample.group_id, []).append(sample)
+
+    for group_id, group_samples in non_input_groups.items():
+        peak_types = sorted({sample.peak_type for sample in group_samples})
+        if len(peak_types) > 1:
+            errors.append(
+                f"group_id {group_id!r}: non-input samples must share the same "
+                f"peak_type; found {', '.join(peak_types)}"
+            )
+
+        qvalues: dict[Decimal, set[str]] = {}
+        for sample in group_samples:
+            parsed_qvalue = _parse_qvalue(sample.qvalue)
+            if (
+                parsed_qvalue is not None
+                and Decimal("0") < parsed_qvalue <= Decimal("1")
+            ):
+                qvalues.setdefault(parsed_qvalue, set()).add(sample.qvalue)
+        if len(qvalues) > 1:
+            displayed_qvalues = sorted(
+                value
+                for equivalent_values in qvalues.values()
+                for value in equivalent_values
+            )
+            errors.append(
+                f"group_id {group_id!r}: non-input samples must use the same "
+                f"qvalue; found {', '.join(displayed_qvalues)}"
+            )
 
     if errors:
         raise SamplesheetValidationError(errors)

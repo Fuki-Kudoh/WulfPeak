@@ -136,8 +136,98 @@ class SamplesheetTests(unittest.TestCase):
                 rows = valid_rows()
                 rows[0]["qvalue"] = bad_qvalue
                 write_sheet(self.sheet, rows)
-                with self.assertRaisesRegex(SamplesheetValidationError, "qvalue must be numeric"):
+                with self.assertRaisesRegex(
+                    SamplesheetValidationError, "qvalue must be numeric and finite"
+                ):
                     load_samplesheet(self.sheet)
+
+    def test_peak_qvalue_must_be_in_macs_range(self) -> None:
+        for bad_qvalue in ("-1", "0", "1.1"):
+            with self.subTest(bad_qvalue=bad_qvalue):
+                rows = valid_rows()
+                rows[0]["qvalue"] = bad_qvalue
+                write_sheet(self.sheet, rows)
+                with self.assertRaisesRegex(
+                    SamplesheetValidationError,
+                    "qvalue must satisfy 0 < qvalue <= 1",
+                ):
+                    load_samplesheet(self.sheet)
+
+    def test_peak_qvalue_accepts_range_boundaries(self) -> None:
+        for valid_qvalue in ("1", "0.01"):
+            with self.subTest(valid_qvalue=valid_qvalue):
+                rows = valid_rows()
+                rows[0]["qvalue"] = valid_qvalue
+                write_sheet(self.sheet, rows)
+                self.assertEqual(load_samplesheet(self.sheet)[0].qvalue, valid_qvalue)
+
+    def test_non_input_group_requires_one_peak_type(self) -> None:
+        rows = valid_rows()
+        rows.insert(
+            1,
+            {
+                "input_id": "chip_S2",
+                "sample_id": "chip_2",
+                "group_id": "chip",
+                "peak_type": "broad",
+                "control": "input_1",
+                "qvalue": "0.01",
+            },
+        )
+        write_sheet(self.sheet, rows)
+
+        with self.assertRaisesRegex(
+            SamplesheetValidationError,
+            "group_id 'chip': non-input samples must share the same peak_type; "
+            "found broad, narrow",
+        ):
+            load_samplesheet(self.sheet)
+
+    def test_input_samples_do_not_participate_in_group_peak_type_validation(self) -> None:
+        rows = valid_rows()
+        rows[1]["group_id"] = "chip"
+        write_sheet(self.sheet, rows)
+
+        self.assertEqual(len(load_samplesheet(self.sheet)), 2)
+
+    def test_non_input_group_requires_one_qvalue(self) -> None:
+        rows = valid_rows()
+        rows.insert(
+            1,
+            {
+                "input_id": "chip_S2",
+                "sample_id": "chip_2",
+                "group_id": "chip",
+                "peak_type": "narrow",
+                "control": "input_1",
+                "qvalue": "0.05",
+            },
+        )
+        write_sheet(self.sheet, rows)
+
+        with self.assertRaisesRegex(
+            SamplesheetValidationError,
+            "group_id 'chip': non-input samples must use the same qvalue; "
+            "found 0.01, 0.05",
+        ):
+            load_samplesheet(self.sheet)
+
+    def test_group_qvalue_comparison_is_numeric(self) -> None:
+        rows = valid_rows()
+        rows.insert(
+            1,
+            {
+                "input_id": "chip_S2",
+                "sample_id": "chip_2",
+                "group_id": "chip",
+                "peak_type": "narrow",
+                "control": "input_1",
+                "qvalue": "1e-2",
+            },
+        )
+        write_sheet(self.sheet, rows)
+
+        self.assertEqual(len(load_samplesheet(self.sheet)), 3)
 
     def test_input_row_requires_dots(self) -> None:
         for field, value in (("qvalue", "0.01"), ("control", "chip_1")):
