@@ -1,0 +1,5 @@
+input_id	sample_id	group_id	peak_type	control	qvalue
+4w_CTCF_1_S1	4w_CTCF_1	4w_CTCF	narrow	4w_input	0.01
+4w_CTCF_2_S2	4w_CTCF_2	4w_CTCF	narrow	4w_input	0.01
+4w_CTCF_3_S3	4w_CTCF_3	4w_CTCF	narrow	4w_input	0.01
+4w_input_S4	4w_input	4w_input	input	.	.
