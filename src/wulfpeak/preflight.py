@@ -6,7 +6,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import RunConfig
+from .config import PHASES, RunConfig
 from .fastq import FastqDiscoveryError, discover_fastq_input
 from .manifest import ResolvedSample, build_groups, resolve_sample
 from .models import ReplicateGroup, ToolInfo
@@ -138,10 +138,25 @@ def run_preflight(config: RunConfig) -> PreflightResult:
             f"--force-from {config.force_from} is not applicable because the "
             "samplesheet contains no treatment groups"
         )
+    tool_phase = {
+        "fastqc": "fastqc_raw",
+        "trim_galore": "trim",
+        "bowtie2": "align",
+        "samtools": "align",
+        "bamCoverage": "coverage",
+        "macs3": "peak",
+        "bedtools": "consensus_peak",
+        "multiqc": "report",
+    }
+    # Dry-run remains full-preflight even when its displayed plan is truncated.
+    # Real coverage execution intentionally needs only the implemented tools.
+    selected_stop = PHASES[-1] if config.dry_run else (config.stop_after or "coverage")
+    stop_index = PHASES.index(selected_stop)
     required_tools = tuple(
         name
         for name in REQUIRED_TOOLS
-        if groups or name not in {"macs3", "bedtools"}
+        if PHASES.index(tool_phase[name]) <= stop_index
+        and (groups or name not in {"macs3", "bedtools"})
     )
     try:
         tools, tool_warnings = detect_tools(required_tools)

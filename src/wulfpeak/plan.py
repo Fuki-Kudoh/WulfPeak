@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .config import RunConfig
+from .config import PHASES, RunConfig
 from .consensus import build_consensus_plan
 from .manifest import ResolvedSample
 from .models import ReadLayout, ReplicateGroup, ToolInfo
@@ -39,8 +39,8 @@ def _fastqc_artifacts(
     for read in reads:
         basename = _fastqc_basename(read)
         for extension, kind, validator in (
-            ("html", "html", "html_nonempty"),
-            ("zip", "zip", "zip_nonempty"),
+            ("html", "html", "fastqc_html"),
+            ("zip", "zip", "fastqc_zip"),
         ):
             filename = f"{basename}_fastqc.{extension}"
             artifacts.append(
@@ -186,10 +186,18 @@ def build_command_plan(
     samples: tuple[ResolvedSample, ...],
     groups: tuple[ReplicateGroup, ...],
     tools: dict[str, ToolInfo],
+    *,
+    stop_after: str | None = None,
 ) -> dict[str, object]:
     """Return complete actions and promotion contracts without executing them."""
 
     output = config.output_dir
+    selected_stop = stop_after or PHASES[-1]
+    stop_index = PHASES.index(selected_stop)
+
+    def includes(phase: str) -> bool:
+        return PHASES.index(phase) <= stop_index
+
     steps: list[dict[str, object]] = []
     for resolved in samples:
         sample = resolved.sample
@@ -245,7 +253,7 @@ def build_command_plan(
                     "fastq",
                     trim_tmp / "canonical" / canonical_read.name,
                     canonical_read,
-                    validator="fastq_nonempty",
+                    validator="gzip_fastq",
                 )
             )
         trimming_report = output / "qc" / "trimming" / sample_id / "trimming_report.txt"
@@ -531,7 +539,7 @@ def build_command_plan(
             )
         )
 
-        if sample.peak_type != "input":
+        if includes("peak") and sample.peak_type != "input":
             extension = (
                 "broadPeak" if sample.peak_type == "broad" else "narrowPeak"
             )
@@ -559,7 +567,7 @@ def build_command_plan(
                 _record("peak", "sample", sample_id, actions, artifacts)
             )
 
-    for group in groups:
+    for group in groups if includes("pool_bam") else ():
         pool_tmp = _step_tmp(output, "groups", group.group_id, "pool_bam")
         pooled_bam_tmp = pool_tmp / f"{group.group_id}.pooled.bam"
         pooled_bai_tmp = Path(str(pooled_bam_tmp) + ".bai")
@@ -608,6 +616,9 @@ def build_command_plan(
             )
         )
 
+        if not includes("pooled_peak"):
+            continue
+
         extension = "broadPeak" if group.peak_type == "broad" else "narrowPeak"
         pooled_root = output / "peaks" / "pooled" / group.group_id
         pooled_name = f"{group.group_id}.pooled.peaks.{extension}"
@@ -639,6 +650,9 @@ def build_command_plan(
             )
         )
 
+        if not includes("consensus_peak"):
+            continue
+
         replicate_peaks = tuple(
             output
             / "peaks"
@@ -666,6 +680,26 @@ def build_command_plan(
                 metadata=consensus_metadata,
             )
         )
+
+    if not includes("report"):
+        steps = [
+            step
+            for step in steps
+            if PHASES.index(str(step["phase"])) <= stop_index
+        ]
+        return {
+            "schema_version": 2,
+            "dry_run": config.dry_run,
+            "read_layout": config.read_layout.value,
+            "stop_after": selected_stop,
+            "artifact_contract": {
+                "command_outputs": "write temporary_path only",
+                "validation": "run the declared validator on temporary_path",
+                "promotion": "os.replace each validated file without replacing its parent directory",
+                "failure": "never promote partial or invalid output",
+            },
+            "steps": steps,
+        }
 
     report_tmp = _step_tmp(output, "pipeline", "run", "report")
     multiqc_tmp = report_tmp / "multiqc"
@@ -729,6 +763,7 @@ def build_command_plan(
         "schema_version": 2,
         "dry_run": config.dry_run,
         "read_layout": config.read_layout.value,
+        "stop_after": selected_stop,
         "artifact_contract": {
             "command_outputs": "write temporary_path only",
             "validation": "run the declared validator on temporary_path",
