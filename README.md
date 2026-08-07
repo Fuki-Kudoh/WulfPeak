@@ -153,6 +153,15 @@ applicable sample. Execution remains fail-fast: one sample failure stops the
 run, and resume skips reusable completed samples in that phase before
 continuing from failed or incomplete work.
 
+`--threads` is an approximate per-sample CPU budget. Concurrent pipelines use
+a centralized allocation policy instead of assigning that full value to every
+process: alignment divides the budget between Bowtie2 and the samtools collate
+main/worker threads, while BAM processing reserves one main thread each for
+fixmate and sort and assigns the remainder to sort workers. A budget of one
+uses no additional samtools workers, although a streaming pipeline still
+requires its two main processes. The resolved allocation is recorded in
+`command_plan.json` as `thread_allocation`.
+
 `--stop-after` defaults to `coverage` for a real run. This release accepts
 only that real execution boundary; a later stop such as `peak` fails before
 preflight. MACS3, pooled BAM, consensus, MultiQC, and reporting actions remain

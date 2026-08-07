@@ -14,6 +14,7 @@ from .plan_schema import (
     internal_action,
     pipeline_action,
 )
+from .resources import allocate_threads
 
 
 def _tool(tools: dict[str, ToolInfo], name: str) -> str:
@@ -198,6 +199,7 @@ def build_command_plan(
     """Return complete actions and promotion contracts without executing them."""
 
     output = config.output_dir
+    thread_allocation = allocate_threads(config.threads)
     selected_stop = stop_after or PHASES[-1]
     stop_index = PHASES.index(selected_stop)
 
@@ -342,7 +344,7 @@ def build_command_plan(
             )
         else:
             align.extend(["-x", str(config.bowtie2_index), "-U", trimmed_reads[0]])
-        align.extend(["-p", str(config.threads)])
+        align.extend(["-p", str(thread_allocation.bowtie2_threads)])
         steps.append(
             _record(
                 "align",
@@ -356,7 +358,7 @@ def build_command_plan(
                                 _tool(tools, "samtools"),
                                 "collate",
                                 "-@",
-                                str(config.threads),
+                                str(thread_allocation.collate_workers),
                                 "-o",
                                 str(temporary_collated),
                                 "-",
@@ -422,7 +424,7 @@ def build_command_plan(
                         _tool(tools, "samtools"),
                         "sort",
                         "-@",
-                        str(config.threads),
+                        str(thread_allocation.sort_workers),
                         "-o",
                         str(coordinate_bam),
                         "-",
@@ -435,7 +437,7 @@ def build_command_plan(
                     _tool(tools, "samtools"),
                     "index",
                     "-@",
-                    str(config.threads),
+                    str(thread_allocation.samtools_workers),
                     str(final_bam_tmp),
                 ]
             ),
@@ -444,7 +446,7 @@ def build_command_plan(
                     _tool(tools, "samtools"),
                     "flagstat",
                     "-@",
-                    str(config.threads),
+                    str(thread_allocation.samtools_workers),
                     str(final_bam_tmp),
                 ],
                 stdout_path=qc_paths["flagstat"],
@@ -454,7 +456,7 @@ def build_command_plan(
                     _tool(tools, "samtools"),
                     "stats",
                     "-@",
-                    str(config.threads),
+                    str(thread_allocation.samtools_workers),
                     str(final_bam_tmp),
                 ],
                 stdout_path=qc_paths["stats"],
@@ -582,7 +584,7 @@ def build_command_plan(
                             _tool(tools, "samtools"),
                             "merge",
                             "-@",
-                            str(config.threads),
+                            str(thread_allocation.samtools_workers),
                             str(pooled_bam_tmp),
                             *member_bams,
                         ]
@@ -592,7 +594,7 @@ def build_command_plan(
                             _tool(tools, "samtools"),
                             "index",
                             "-@",
-                            str(config.threads),
+                            str(thread_allocation.samtools_workers),
                             str(pooled_bam_tmp),
                         ]
                     ),
@@ -687,6 +689,7 @@ def build_command_plan(
             "dry_run": config.dry_run,
             "read_layout": config.read_layout.value,
             "stop_after": selected_stop,
+            "thread_allocation": thread_allocation.as_plan_metadata(),
             "artifact_contract": {
                 "command_outputs": "write temporary_path only",
                 "validation": "run the declared validator on temporary_path",
@@ -759,6 +762,7 @@ def build_command_plan(
         "dry_run": config.dry_run,
         "read_layout": config.read_layout.value,
         "stop_after": selected_stop,
+        "thread_allocation": thread_allocation.as_plan_metadata(),
         "artifact_contract": {
             "command_outputs": "write temporary_path only",
             "validation": "run the declared validator on temporary_path",
