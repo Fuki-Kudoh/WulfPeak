@@ -57,14 +57,26 @@ def write_step_state(
     output = Path(output_dir)
     status_path = output / "status" / scope / scope_id / f"{state.key}.status"
     state_path = output / "status" / "state.json"
-    try:
-        payload = json.loads(state_path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        payload = {"steps": {}}
     step_id = f"{state_scopes[scope]}:{scope_id}:{state.key}"
-    payload.setdefault("steps", {})[step_id] = asdict(state)
-    # Both files use the same atomic helper; JSON is replaced before the compact marker.
-    atomic_write_json(state_path, payload)
+    lock_path = output / "status" / ".locks" / "state.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    # Use a separate open file description per call: flock then coordinates both
+    # worker threads today and independent processes in a future scheduler.
+    with lock_path.open("a+", encoding="utf-8") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            try:
+                payload = json.loads(state_path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                payload = {"steps": {}}
+            steps = payload.setdefault("steps", {})
+            if not isinstance(steps, dict):
+                raise ValueError(f"invalid shared step state in {state_path}")
+            steps[step_id] = asdict(state)
+            atomic_write_json(state_path, payload)
+        finally:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+    # Compact markers have unique sample/phase paths and need no shared lock.
     atomic_write_text(status_path, state.status + "\n")
 
 

@@ -93,6 +93,53 @@ class RunCliTests(unittest.TestCase):
         make_index(root / "index" / "reference")
         return fake_bin
 
+    def test_jobs_defaults_to_one_and_is_recorded_in_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_bin = self.prepare(root)
+            (root / "samples.tsv").write_text(
+                "input_id\tsample_id\tgroup_id\tpeak_type\tcontrol\tqvalue\n"
+                "library_01\tsample_01\tgroup_01\tinput\t.\t.\n",
+                encoding="utf-8",
+            )
+            (root / "fastq" / "library_01.fastq.gz").write_bytes(b"synthetic")
+            with environment("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}"):
+                self.assertEqual(main(run_args(root, single_end=True)), 0)
+            manifest = json.loads(
+                (root / "out" / "config" / "manifest.json").read_text()
+            )
+            metadata = json.loads(
+                (root / "out" / "metadata" / "run_metadata.json").read_text()
+            )
+            plan = json.loads(
+                (root / "out" / "config" / "command_plan.json").read_text()
+            )
+            self.assertEqual(manifest["parameters"]["jobs"], 1)
+            self.assertEqual(metadata["options"]["jobs"], 1)
+            self.assertEqual(plan["jobs"], 1)
+
+    def test_positive_jobs_is_accepted_and_nonpositive_values_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_bin = self.prepare(root)
+            (root / "samples.tsv").write_text(
+                "input_id\tsample_id\tgroup_id\tpeak_type\tcontrol\tqvalue\n"
+                "library_01\tsample_01\tgroup_01\tinput\t.\t.\n",
+                encoding="utf-8",
+            )
+            (root / "fastq" / "library_01.fastq.gz").write_bytes(b"synthetic")
+            with environment("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}"):
+                self.assertEqual(
+                    main([*run_args(root, single_end=True), "--jobs", "2"]), 0
+                )
+            plan = json.loads(
+                (root / "out" / "config" / "command_plan.json").read_text()
+            )
+            self.assertEqual(plan["jobs"], 2)
+            for invalid in ("0", "-1"):
+                with self.assertRaises(SystemExit):
+                    main([*run_args(root, single_end=True), "--jobs", invalid])
+
     def test_single_end_check_writes_null_r2_and_empty_qc_columns(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

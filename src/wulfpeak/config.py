@@ -40,6 +40,7 @@ class RunConfig:
     bowtie2_index: Path
     effective_genome_size: int
     threads: int
+    jobs: int = 1
     read_layout: ReadLayout = ReadLayout.PAIRED_END
     min_mapq: int = 30
     duplicate_policy: str = "remove"
@@ -60,6 +61,8 @@ class RunConfig:
             errors.append("--genome-id must be non-empty")
         if self.threads <= 0:
             errors.append("--threads must be a positive integer")
+        if self.jobs <= 0:
+            errors.append("--jobs must be a positive integer")
         if self.effective_genome_size <= 0:
             errors.append("--effective-genome-size must be a positive integer")
         if self.min_mapq < 0:

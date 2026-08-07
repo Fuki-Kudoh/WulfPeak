@@ -7,6 +7,8 @@ import json
 import os
 import tempfile
 import textwrap
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -46,6 +48,7 @@ FAKE_TOOL = r'''#!/usr/bin/env python3
 import gzip
 import os
 import sys
+import time
 import zipfile
 from pathlib import Path
 
@@ -121,6 +124,18 @@ if name == "trim_galore":
     raise SystemExit(0)
 
 if name == "bowtie2":
+    sync_dir = os.environ.get("WULFPEAK_FAKE_SYNC_DIR")
+    if sync_dir:
+        sync = Path(sync_dir)
+        sync.mkdir(parents=True, exist_ok=True)
+        sample = next(
+            (candidate for candidate in ("sample_01", "sample_02", "sample_03")
+             if candidate in " ".join(args)),
+            "unknown",
+        )
+        (sync / f"{sample}.align.started").write_text("started\n")
+        while not (sync / "release-align").exists():
+            time.sleep(0.01)
     if not fail:
         sys.stdout.buffer.write(b"synthetic alignment\n")
     raise SystemExit(9 if fail else 0)
@@ -320,6 +335,39 @@ def samtools_analysis_calls(counter: Path) -> int:
 
 
 class ExecutionTests(unittest.TestCase):
+    def test_jobs_two_overlaps_align_and_preserves_bam_phase_barrier(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args, fake_bin = prepare_two_sample_run(root)
+            sync = root / "sync"
+            counter = root / "counter.tsv"
+            result: list[int] = []
+            with environment(
+                PATH=f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                WULFPEAK_FAKE_SYNC_DIR=str(sync),
+                WULFPEAK_FAKE_COUNTER=str(counter),
+            ):
+                run = threading.Thread(
+                    target=lambda: result.append(main([*args, "--jobs", "2"]))
+                )
+                run.start()
+                deadline = time.monotonic() + 15
+                markers = {
+                    sync / "sample_01.align.started",
+                    sync / "sample_02.align.started",
+                }
+                while not all(path.exists() for path in markers):
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(0.01)
+                # Both alignments are held at an explicit gate. No bam_process
+                # command may cross the phase barrier while either is active.
+                invocations = counter.read_text(encoding="utf-8")
+                self.assertNotIn("samtools\tfixmate", invocations)
+                (sync / "release-align").write_text("release\n")
+                run.join(timeout=30)
+            self.assertFalse(run.is_alive())
+            self.assertEqual(result, [0])
+
     def test_phase_major_fail_fast_resume_continues_with_failed_sample(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
