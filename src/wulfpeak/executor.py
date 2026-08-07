@@ -86,13 +86,16 @@ class StepExecutor:
             raise ValueError("canonical_temporary_paths must be a list of strings")
         targets = [Path(item) for item in targets_value]
         fastq_targets = [path for path in targets if path.name.endswith(".fq.gz")]
-        report_targets = [path for path in targets if path.name.endswith(".txt")]
+        report_dir_value = action.get("report_temporary_directory")
+        if not isinstance(report_dir_value, str):
+            raise ValueError("report_temporary_directory must be a string")
+        report_dir = Path(report_dir_value)
         expected_suffixes = (
             ("_val_1.fq.gz", "_val_2.fq.gz")
             if layout == "paired_end"
             else ("_trimmed.fq.gz",)
         )
-        if len(fastq_targets) != len(expected_suffixes) or len(report_targets) != 1:
+        if len(fastq_targets) != len(expected_suffixes):
             raise ValueError("Trim Galore normalization targets do not match read layout")
 
         sources: list[Path] = []
@@ -122,6 +125,17 @@ class StepExecutor:
                 "Expected one Trim Galore report per input read; "
                 f"found {len(reports)}"
             )
+        json_reports = sorted(
+            path
+            for path in output_dir.glob("*_trimming_report.json")
+            if path.is_file() and "canonical" not in path.parts
+        )
+        if json_reports and len(json_reports) != len(expected_suffixes):
+            raise ValueError(
+                "Expected either no Trim Galore JSON reports or one per input read; "
+                f"found {len(json_reports)}"
+            )
+        report_dir.mkdir(parents=True, exist_ok=True)
         report_text = ""
         for report in reports:
             if len(reports) > 1:
@@ -129,7 +143,9 @@ class StepExecutor:
             report_text += report.read_text(encoding="utf-8")
             if report_text and not report_text.endswith("\n"):
                 report_text += "\n"
-        atomic_write_text(report_targets[0], report_text)
+        atomic_write_text(report_dir / "trimming_report.txt", report_text)
+        for report in (*reports, *json_reports):
+            shutil.copy2(report, report_dir / report.name)
 
 
 def reset_step_temporary(output_dir: Path, step: dict[str, object]) -> Path:

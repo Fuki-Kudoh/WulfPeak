@@ -135,7 +135,7 @@ def validate_path(
     samtools: str | Path | None = None,
 ) -> ValidationResult:
     selected = validator or kind
-    if selected == "multiqc_output" or kind == "directory":
+    if selected == "multiqc_output":
         checks: dict[str, object] = {
             "exists": path.exists(),
             "directory": path.is_dir(),
@@ -144,16 +144,64 @@ def validate_path(
             return ValidationResult(False, checks)
         report = path / "multiqc_report.html"
         data = path / "multiqc_data"
+        sources = data / "multiqc_sources.txt"
+        sources_nonempty = False
+        if sources.is_file() and sources.stat().st_size > 0:
+            try:
+                sources_nonempty = bool(sources.read_text(encoding="utf-8").strip())
+            except (OSError, UnicodeError) as exc:
+                checks["sources_error"] = str(exc)
         checks.update(
             {
                 "report_exists": report.is_file(),
                 "report_size": report.stat().st_size if report.is_file() else 0,
                 "data_exists": data.is_dir(),
+                "sources_exists": sources.is_file(),
+                "sources_size": sources.stat().st_size if sources.is_file() else 0,
+                "sources_nonempty": sources_nonempty,
             }
         )
         return ValidationResult(
-            bool(checks["report_size"]) and bool(checks["data_exists"]), checks
+            bool(checks["report_size"])
+            and bool(checks["data_exists"])
+            and sources_nonempty,
+            checks,
         )
+    if selected == "trim_galore_reports":
+        checks = {"exists": path.exists(), "directory": path.is_dir()}
+        if not path.is_dir():
+            return ValidationResult(False, checks)
+        combined = path / "trimming_report.txt"
+        text_reports = sorted(path.glob("*_trimming_report.txt"))
+        json_reports = sorted(path.glob("*_trimming_report.json"))
+        text_nonempty = bool(text_reports) and all(
+            report.stat().st_size > 0 for report in text_reports
+        )
+        json_valid = True
+        for report in json_reports:
+            try:
+                json.loads(report.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError, UnicodeError) as exc:
+                checks["json_error"] = f"{report.name}: {exc}"
+                json_valid = False
+                break
+        checks.update(
+            {
+                "combined_exists": combined.is_file(),
+                "combined_size": combined.stat().st_size if combined.is_file() else 0,
+                "text_report_count": len(text_reports),
+                "text_reports_nonempty": text_nonempty,
+                "json_report_count": len(json_reports),
+                "json_reports_valid": json_valid,
+            }
+        )
+        return ValidationResult(
+            bool(checks["combined_size"]) and text_nonempty and json_valid,
+            checks,
+        )
+    if kind == "directory":
+        checks = {"exists": path.exists(), "directory": path.is_dir()}
+        return ValidationResult(path.is_dir(), checks)
 
     checks, size = _regular_file_checks(path)
     if size is None:

@@ -264,13 +264,13 @@ def build_command_plan(
                     validator="gzip_fastq",
                 )
             )
-        trimming_report = output / "qc" / "trimming" / sample_id / "trimming_report.txt"
+        trimming_qc_tmp = trim_tmp / "canonical" / "trimming_qc"
         trim_artifacts.append(
             artifact_contract(
-                "text",
-                trim_tmp / "canonical" / "trimming_report.txt",
-                trimming_report,
-                validator="text_nonempty",
+                "directory",
+                trimming_qc_tmp,
+                output / "qc" / "trimming" / sample_id,
+                validator="trim_galore_reports",
             )
         )
         steps.append(
@@ -285,8 +285,11 @@ def build_command_plan(
                         output_dir=str(trim_tmp),
                         read_layout=config.read_layout.value,
                         canonical_temporary_paths=[
-                            artifact["temporary_path"] for artifact in trim_artifacts
+                            artifact["temporary_path"]
+                            for artifact in trim_artifacts
+                            if artifact["kind"] == "fastq"
                         ],
+                        report_temporary_directory=str(trimming_qc_tmp),
                         write_mode="atomic_replace",
                     ),
                 ],
@@ -575,7 +578,7 @@ def build_command_plan(
                     command_action(
                         [
                             _tool(tools, "multiqc"),
-                            str(output),
+                            str(output / "qc"),
                             "--outdir",
                             str(multiqc_tmp),
                         ]

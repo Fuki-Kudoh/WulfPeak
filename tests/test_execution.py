@@ -112,6 +112,10 @@ if name == "trim_galore":
         (out / (Path(read).name + "_trimming_report.txt")).write_text(
             "synthetic trimming report\n", encoding="utf-8"
         )
+        (out / (Path(read).name + "_trimming_report.json")).write_text(
+            '{"trim_galore_version": "2.0", "synthetic": true}\n',
+            encoding="utf-8",
+        )
     if fail:
         raise SystemExit(8)
     raise SystemExit(0)
@@ -186,8 +190,11 @@ if name == "multiqc":
         data = destination / "multiqc_data"
         data.mkdir()
         (data / "multiqc_data.json").write_text("{}\n", encoding="utf-8")
-        (destination / "multiqc_sources.txt").write_text(
-            "synthetic companion\n", encoding="utf-8"
+        (data / "multiqc_sources.txt").write_text(
+            "module\tsource\nfastqc\tsynthetic\n", encoding="utf-8"
+        )
+        (destination / "multiqc_citations.txt").write_text(
+            "synthetic citation\n", encoding="utf-8"
         )
     raise SystemExit(12 if fail else 0)
 
@@ -531,6 +538,10 @@ class ExecutionTests(unittest.TestCase):
                 (multiqc_steps[0]["scope"], multiqc_steps[0]["scope_id"]),
                 ("pipeline", "run"),
             )
+            multiqc_argv = multiqc_steps[0]["actions"][0]["argv"]
+            self.assertEqual(
+                Path(multiqc_argv[1]).resolve(), (output / "qc").resolve()
+            )
             self.assertEqual(
                 [(step["phase"], step["scope_id"]) for step in plan["steps"][-3:]],
                 [
@@ -541,7 +552,25 @@ class ExecutionTests(unittest.TestCase):
             )
             self.assertTrue((output / "multiqc" / "multiqc_report.html").is_file())
             self.assertTrue((output / "multiqc" / "multiqc_data").is_dir())
-            self.assertTrue((output / "multiqc" / "multiqc_sources.txt").is_file())
+            self.assertTrue(
+                (output / "multiqc" / "multiqc_data" / "multiqc_sources.txt").is_file()
+            )
+            self.assertTrue((output / "multiqc" / "multiqc_citations.txt").is_file())
+            self.assertFalse(
+                Path(multiqc_steps[0]["artifacts"][0]["temporary_path"]).exists()
+            )
+            for library, sample in (
+                ("library_01", "sample_01"),
+                ("library_02", "sample_02"),
+            ):
+                trimming_qc = output / "qc" / "trimming" / sample
+                self.assertTrue((trimming_qc / "trimming_report.txt").is_file())
+                self.assertTrue(
+                    (trimming_qc / f"{library}.fastq.gz_trimming_report.txt").is_file()
+                )
+                self.assertTrue(
+                    (trimming_qc / f"{library}.fastq.gz_trimming_report.json").is_file()
+                )
             self.assertEqual(tool_counts(counter)["multiqc"], 1)
 
             metadata = json.loads(
@@ -550,6 +579,18 @@ class ExecutionTests(unittest.TestCase):
             self.assertEqual(metadata["completed_through"], "multiqc")
             manifest = json.loads((output / "output_manifest.json").read_text())
             self.assertEqual(manifest["completed_through"], "multiqc")
+            trimming_outputs = [
+                entry
+                for entry in manifest["outputs"]
+                if entry["phase"] == "trim" and entry["kind"] == "directory"
+            ]
+            self.assertEqual(len(trimming_outputs), 2)
+            self.assertTrue(
+                all(
+                    entry["checks"]["json_report_count"] == 1
+                    for entry in trimming_outputs
+                )
+            )
             self.assertTrue(
                 any(
                     entry["phase"] == "multiqc"

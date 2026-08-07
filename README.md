@@ -133,7 +133,8 @@ a distinct step-temporary path, validator, canonical path, and promotion
 contract. Files use `validate_then_atomic_file_replace`. The complete MultiQC
 directory uses a validated, same-parent staged directory replacement, avoiding
 cross-filesystem rename assumptions and preventing partial reports from being
-promoted. FastQC and MACS3 outputs are declared as individual files, so a
+promoted. The validated temporary directory is removed after successful
+promotion. FastQC and MACS3 outputs are declared as individual files, so a
 forced rerun never replaces a non-empty parent directory. The consensus plan
 normalizes each replicate to merged BED3, records strict-majority support,
 merges qualifying segments, and declares both the canonical BED3 and support
@@ -203,8 +204,12 @@ is then included in `output_manifest.json`.
 
 Normalized BigWig generation remains the responsibility of `coverage`; v0.2.1
 does not change that processing. It adds consolidated QC reporting from the
-FastQC, Trim Galore, and samtools outputs already present under the WulfPeak
-output root. A successful default run preserves the standard MultiQC outputs:
+FastQC, Trim Galore, and samtools outputs already present under the canonical
+`qc/` directory. MultiQC scans only this canonical QC tree, excluding step
+temporary files and reports from previous runs. Original Trim Galore text and
+v2 JSON reports are preserved under `qc/trimming/<sample>/` so MultiQC never
+depends on files under `intermediate/.steps/`. A successful default run
+preserves the standard MultiQC outputs:
 
 ```text
 multiqc/
@@ -234,8 +239,10 @@ phases count against the number of samples; pipeline-scoped MultiQC is shown as
 `wulfpeak validate-outputs` validates an existing `output_manifest.json`
 without rerunning analysis. Validation checks gzip FASTQ structure, FastQC
 HTML and ZIP integrity, final BAMs with `samtools quickcheck`, BAM indexes,
-non-empty QC text, BigWig magic bytes, and the MultiQC report/data directory.
-Because BAM validation is explicit,
+non-empty QC text, Trim Galore source reports, BigWig magic bytes, and the
+MultiQC report/data directory. MultiQC validation also requires a non-empty
+`multiqc_data/multiqc_sources.txt`, confirming that at least one source was
+parsed. Because BAM validation is explicit,
 `samtools` must be available when a manifest contains BAM artifacts.
 
 ## Development

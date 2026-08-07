@@ -118,6 +118,7 @@ def promote_directory_artifact(
         if backup is not None:
             shutil.rmtree(backup)
             backup = None
+        shutil.rmtree(temporary)
         return canonical
     finally:
         if staging.exists():

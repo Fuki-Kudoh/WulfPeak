@@ -28,7 +28,7 @@ from wulfpeak.status import (
     write_pipeline_status,
     write_step_state,
 )
-from wulfpeak.validators import validate_output_manifest
+from wulfpeak.validators import validate_output_manifest, validate_path
 
 
 INDEX_SUFFIXES = (".1", ".2", ".3", ".4", ".rev.1", ".rev.2")
@@ -255,6 +255,58 @@ class FoundationTests(unittest.TestCase):
             self.assertFalse((canonical / "old.txt").exists())
             self.assertEqual(
                 (canonical / "multiqc_data" / "data.json").read_text(), "{}\n"
+            )
+            self.assertFalse(source.exists())
+
+    def test_multiqc_validator_requires_nonempty_sources_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "multiqc"
+            data = output / "multiqc_data"
+            data.mkdir(parents=True)
+            (output / "multiqc_report.html").write_text("<html>report</html>\n")
+
+            self.assertFalse(
+                validate_path(
+                    output, "directory", validator="multiqc_output"
+                ).valid
+            )
+            sources = data / "multiqc_sources.txt"
+            sources.write_text("\n")
+            self.assertFalse(
+                validate_path(
+                    output, "directory", validator="multiqc_output"
+                ).valid
+            )
+            sources.write_text("module\tsource\nfastqc\treads.zip\n")
+            self.assertTrue(
+                validate_path(
+                    output, "directory", validator="multiqc_output"
+                ).valid
+            )
+
+    def test_trim_galore_report_validator_accepts_v1_and_validates_v2_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            reports = Path(temporary)
+            (reports / "trimming_report.txt").write_text("combined\n")
+            (reports / "reads.fastq.gz_trimming_report.txt").write_text("v1\n")
+            self.assertTrue(
+                validate_path(
+                    reports, "directory", validator="trim_galore_reports"
+                ).valid
+            )
+
+            json_report = reports / "reads.fastq.gz_trimming_report.json"
+            json_report.write_text("not json\n")
+            self.assertFalse(
+                validate_path(
+                    reports, "directory", validator="trim_galore_reports"
+                ).valid
+            )
+            json_report.write_text('{"trim_galore_version": "2.0"}\n')
+            self.assertTrue(
+                validate_path(
+                    reports, "directory", validator="trim_galore_reports"
+                ).valid
             )
 
     def test_resume_requires_done_signature_outputs_and_upstream(self) -> None:
