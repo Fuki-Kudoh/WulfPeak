@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wulfpeak"
-version = "0.2.1"
+version = "0.1.0"
 description = "A strict, resumable ChIP-seq and CUT&Tag peak-calling workflow"
 readme = "README.md"
 requires-python = ">=3.10"

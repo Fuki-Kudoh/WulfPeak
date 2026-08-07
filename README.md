@@ -1,7 +1,7 @@
 # WulfPeak
 
 WulfPeak uses a compact samplesheet and exact, non-recursive FASTQ discovery.
-The v0.2.1 implementation supports paired-end (default) and single-end input
+The v0.2.0 implementation supports paired-end (default) and single-end input
 validation, deterministic command plans, status inspection, conservative
 resume, and real per-sample execution through normalized bigWig coverage.
 
@@ -169,12 +169,16 @@ direct input fingerprints, every retained canonical output validates, and its
 upstream chain was also reusable. Use `--force-from PHASE` to rebuild that
 phase and everything after it, or `--no-resume` to rebuild all six phases.
 
-By default, WulfPeak removes the reproducible unsorted alignment BAM and
-samtools processing scratch BAMs after that sample completes coverage. These
-retired files are not required by `output_manifest.json`, and resume reuses
-their downstream validated BAM or regenerates alignment when BAM processing
-must rerun. Pass `--keep-intermediates` to retain the unsorted and scratch BAMs;
-the retained unsorted BAM is then included in the output manifest.
+Alignment streams directly from Bowtie2 into a name-collated BAM, which is the
+resumable alignment checkpoint. BAM processing streams `fixmate` into `sort`
+and `markdup` into the final filtering step, avoiding unsorted, fixmate, and
+marked BAM materializations. By default, WulfPeak removes the collated
+checkpoint and coordinate-sort scratch as soon as that sample completes
+`bam_process`; coverage failures therefore do not retain cohort-wide BAM
+scratch. Resume reuses the downstream validated final BAM or regenerates the
+alignment checkpoint when BAM processing must rerun. Pass `--keep-intermediates`
+to retain the collated checkpoint and coordinate-sort scratch; the checkpoint
+is then included in `output_manifest.json`.
 
 A successful real run writes `output_manifest.json` only for artifacts through
 coverage, records `dry_run: false` and `completed_through: coverage` in run

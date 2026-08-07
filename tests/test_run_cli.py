@@ -216,6 +216,28 @@ class RunCliTests(unittest.TestCase):
             bam_step = next(
                 step for step in plan["steps"] if step["phase"] == "bam_process"
             )
+            align_commands = command_argvs(align)
+            self.assertEqual(align_commands[1][1], "collate")
+            self.assertTrue(
+                align["artifacts"][0]["canonical_path"].endswith(
+                    ".name-collated.bam"
+                )
+            )
+            bam_pipelines = [
+                action
+                for action in bam_step["actions"]
+                if action["type"] == "pipeline"
+            ]
+            self.assertEqual(
+                [
+                    [command["argv"][1] for command in action["commands"]]
+                    for action in bam_pipelines
+                ],
+                [["fixmate", "sort"], ["markdup", "view"]],
+            )
+            serialized_bam_plan = json.dumps(bam_step)
+            for forbidden in ("unsorted.bam", "fixmate.bam", "marked.bam"):
+                self.assertNotIn(forbidden, serialized_bam_plan)
             for tool_name in ("flagstat", "stats", "idxstats"):
                 action = next(
                     action

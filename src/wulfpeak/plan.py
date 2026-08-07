@@ -318,9 +318,12 @@ def build_command_plan(
         )
 
         align_tmp = _step_tmp(output, "samples", sample_id, "align")
-        temporary_unsorted = align_tmp / f"{sample_id}.unsorted.bam"
-        canonical_unsorted = (
-            output / "intermediate" / "alignment" / f"{sample_id}.unsorted.bam"
+        temporary_collated = align_tmp / f"{sample_id}.name-collated.bam"
+        canonical_collated = (
+            output
+            / "intermediate"
+            / "alignment"
+            / f"{sample_id}.name-collated.bam"
         )
         align = [_tool(tools, "bowtie2"), "--very-sensitive"]
         if config.read_layout is ReadLayout.PAIRED_END:
@@ -351,10 +354,11 @@ def build_command_plan(
                             align,
                             [
                                 _tool(tools, "samtools"),
-                                "view",
-                                "-b",
+                                "collate",
+                                "-@",
+                                str(config.threads),
                                 "-o",
-                                str(temporary_unsorted),
+                                str(temporary_collated),
                                 "-",
                             ],
                         ]
@@ -363,8 +367,8 @@ def build_command_plan(
                 [
                     artifact_contract(
                         "bam",
-                        temporary_unsorted,
-                        canonical_unsorted,
+                        temporary_collated,
+                        canonical_collated,
                         validator="bam_nonempty",
                     )
                 ],
@@ -372,10 +376,7 @@ def build_command_plan(
         )
 
         bam_tmp = _step_tmp(output, "samples", sample_id, "bam_process")
-        collated_bam = bam_tmp / "name-collated.bam"
-        fixmate_bam = bam_tmp / "fixmate.bam"
         coordinate_bam = bam_tmp / "coordinate.bam"
-        marked_bam = bam_tmp / "marked.bam"
         final_bam_tmp = bam_tmp / f"{sample_id}.final.bam"
         final_bai_tmp = Path(str(final_bam_tmp) + ".bai")
         final_bam = output / "bam" / f"{sample_id}.final.bam"
@@ -389,7 +390,7 @@ def build_command_plan(
         ]
         if config.duplicate_policy == "remove":
             markdup.append("-r")
-        markdup.extend([str(coordinate_bam), str(marked_bam)])
+        markdup.extend([str(coordinate_bam), "-"])
         filter_command = [
             _tool(tools, "samtools"),
             "view",
@@ -401,46 +402,34 @@ def build_command_plan(
             filter_command.extend(["-f", "2", "-F", "2828"])
         else:
             filter_command.extend(["-F", "2820"])
-        filter_command.extend(["-o", str(final_bam_tmp), str(marked_bam)])
+        filter_command.extend(["-o", str(final_bam_tmp), "-"])
         qc_paths = {
             "flagstat": bam_tmp / f"{sample_id}.flagstat.txt",
             "stats": bam_tmp / f"{sample_id}.stats.txt",
             "idxstats": bam_tmp / f"{sample_id}.idxstats.txt",
         }
         bam_actions = [
-            command_action(
+            pipeline_action(
                 [
-                    _tool(tools, "samtools"),
-                    "collate",
-                    "-@",
-                    str(config.threads),
-                    "-o",
-                    str(collated_bam),
-                    str(canonical_unsorted),
+                    [
+                        _tool(tools, "samtools"),
+                        "fixmate",
+                        "-m",
+                        str(canonical_collated),
+                        "-",
+                    ],
+                    [
+                        _tool(tools, "samtools"),
+                        "sort",
+                        "-@",
+                        str(config.threads),
+                        "-o",
+                        str(coordinate_bam),
+                        "-",
+                    ],
                 ]
             ),
-            command_action(
-                [
-                    _tool(tools, "samtools"),
-                    "fixmate",
-                    "-m",
-                    str(collated_bam),
-                    str(fixmate_bam),
-                ]
-            ),
-            command_action(
-                [
-                    _tool(tools, "samtools"),
-                    "sort",
-                    "-@",
-                    str(config.threads),
-                    "-o",
-                    str(coordinate_bam),
-                    str(fixmate_bam),
-                ]
-            ),
-            command_action(markdup),
-            command_action(filter_command),
+            pipeline_action([markdup, filter_command]),
             command_action(
                 [
                     _tool(tools, "samtools"),

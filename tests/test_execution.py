@@ -54,9 +54,11 @@ if counter:
         handle.write(name + "\t" + " ".join(args) + "\n")
 
 fail_sample = os.environ.get("WULFPEAK_FAKE_FAIL_SAMPLE")
+fail_subcommand = os.environ.get("WULFPEAK_FAKE_FAIL_SUBCOMMAND")
 fail = (
     os.environ.get("WULFPEAK_FAKE_FAIL") == name
     and (not fail_sample or fail_sample in " ".join(args))
+    and (not fail_subcommand or (args and args[0] == fail_subcommand))
 )
 invalid = os.environ.get("WULFPEAK_FAKE_INVALID") == name
 
@@ -132,15 +134,25 @@ if name == "samtools":
         destination.write_bytes(b"BAM\x01synthetic\n")
     elif subcommand == "collate":
         destination = Path(option("-o"))
+        sys.stdin.buffer.read()
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(Path(args[-1]).read_bytes())
+        destination.write_bytes(b"BAM\x01synthetic\n")
     elif subcommand == "fixmate":
-        Path(args[-1]).write_bytes(Path(args[-2]).read_bytes())
+        data = Path(args[-2]).read_bytes()
+        if args[-1] == "-":
+            sys.stdout.buffer.write(data)
+        else:
+            Path(args[-1]).write_bytes(data)
     elif subcommand == "sort":
-        Path(option("-o")).write_bytes(Path(args[-1]).read_bytes())
+        data = sys.stdin.buffer.read() if args[-1] == "-" else Path(args[-1]).read_bytes()
+        Path(option("-o")).write_bytes(data)
     elif subcommand == "markdup":
         Path(option("-f")).write_text("synthetic markdup metrics\n", encoding="utf-8")
-        Path(args[-1]).write_bytes(Path(args[-2]).read_bytes())
+        data = Path(args[-2]).read_bytes()
+        if args[-1] == "-":
+            sys.stdout.buffer.write(data)
+        else:
+            Path(args[-1]).write_bytes(data)
     elif subcommand == "index":
         bam = Path(args[-1])
         Path(str(bam) + ".bai").write_bytes(b"BAI\x01synthetic\n")
@@ -229,7 +241,8 @@ def prepare_two_sample_run(root: Path) -> tuple[list[str], Path]:
 
 def run_with_tools(
     args: list[str], fake_bin: Path, *, counter: Path, fail: str | None = None,
-    fail_sample: str | None = None, invalid: str | None = None,
+    fail_sample: str | None = None, fail_subcommand: str | None = None,
+    invalid: str | None = None,
 ) -> tuple[int, str]:
     stderr = io.StringIO()
     with environment(
@@ -237,6 +250,7 @@ def run_with_tools(
         WULFPEAK_FAKE_COUNTER=str(counter),
         WULFPEAK_FAKE_FAIL=fail,
         WULFPEAK_FAKE_FAIL_SAMPLE=fail_sample,
+        WULFPEAK_FAKE_FAIL_SUBCOMMAND=fail_subcommand,
         WULFPEAK_FAKE_INVALID=invalid,
     ), contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
         code = main(args)
@@ -363,6 +377,62 @@ class ExecutionTests(unittest.TestCase):
                 {"done"},
             )
 
+    def test_bam_scratch_is_cleaned_before_coverage_phase_begins(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args, fake_bin = prepare_two_sample_run(root)
+            counter = root / "calls.log"
+
+            code, error = run_with_tools(
+                args,
+                fake_bin,
+                counter=counter,
+                fail="samtools",
+                fail_sample="sample_02",
+                fail_subcommand="fixmate",
+            )
+            self.assertEqual(code, 3)
+            self.assertIn("Step bam_process failed for sample sample_02", error)
+
+            output = root / "out"
+            sample1_checkpoint = (
+                output
+                / "intermediate"
+                / "alignment"
+                / "sample_01.name-collated.bam"
+            )
+            sample1_scratch = (
+                output
+                / "intermediate"
+                / ".steps"
+                / "samples"
+                / "sample_01"
+                / "bam_process"
+            )
+            self.assertFalse(sample1_checkpoint.exists())
+            self.assertFalse(sample1_scratch.exists())
+            self.assertTrue((output / "bam" / "sample_01.final.bam").is_file())
+
+            sample2_checkpoint = (
+                output
+                / "intermediate"
+                / "alignment"
+                / "sample_02.name-collated.bam"
+            )
+            self.assertTrue(sample2_checkpoint.is_file())
+            state = json.loads((output / "status" / "state.json").read_text())
+            self.assertEqual(
+                state["steps"]["sample:sample_01:bam_process"]["status"],
+                "done",
+            )
+            self.assertEqual(
+                state["steps"]["sample:sample_02:bam_process"]["status"],
+                "failed",
+            )
+            self.assertFalse(
+                any(key.endswith(":coverage") for key in state["steps"])
+            )
+
     def test_single_end_executes_through_coverage(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -389,7 +459,12 @@ class ExecutionTests(unittest.TestCase):
             })
             self.assertTrue((output / "bigwig" / "sample_01.normalized.bw").is_file())
             self.assertFalse(
-                (output / "intermediate" / "alignment" / "sample_01.unsorted.bam").exists()
+                (
+                    output
+                    / "intermediate"
+                    / "alignment"
+                    / "sample_01.name-collated.bam"
+                ).exists()
             )
             self.assertFalse(
                 (
@@ -554,7 +629,7 @@ class ExecutionTests(unittest.TestCase):
                     / "out"
                     / "intermediate"
                     / "alignment"
-                    / "sample_01.unsorted.bam"
+                    / "sample_01.name-collated.bam"
                 ).exists()
             )
 
@@ -577,7 +652,7 @@ class ExecutionTests(unittest.TestCase):
             self.assertEqual(bigwig.read_bytes(), previous)
             self.assertEqual(tool_counts(counter)["bowtie2"], initial["bowtie2"])
 
-    def test_failed_coverage_retains_intermediates_until_success(self) -> None:
+    def test_bam_process_cleans_scratch_before_coverage_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             args, fake_bin = prepare_run(root, paired=False)
@@ -590,7 +665,12 @@ class ExecutionTests(unittest.TestCase):
             )
             self.assertEqual(code, 3)
             output = root / "out"
-            unsorted = output / "intermediate" / "alignment" / "sample_01.unsorted.bam"
+            checkpoint = (
+                output
+                / "intermediate"
+                / "alignment"
+                / "sample_01.name-collated.bam"
+            )
             scratch = (
                 output
                 / "intermediate"
@@ -599,14 +679,18 @@ class ExecutionTests(unittest.TestCase):
                 / "sample_01"
                 / "bam_process"
             )
-            self.assertTrue(unsorted.is_file())
-            self.assertTrue((scratch / "marked.bam").is_file())
+            self.assertFalse(checkpoint.exists())
+            self.assertFalse(scratch.exists())
+            self.assertTrue((output / "bam" / "sample_01.final.bam").is_file())
+            before_resume = tool_counts(counter)
+            before_samtools = samtools_analysis_calls(counter)
 
             self.assertEqual(run_with_tools(args, fake_bin, counter=counter)[0], 0)
-            self.assertFalse(unsorted.exists())
-            self.assertFalse(scratch.exists())
+            after_resume = tool_counts(counter)
+            self.assertEqual(after_resume["bowtie2"], before_resume["bowtie2"])
+            self.assertEqual(samtools_analysis_calls(counter), before_samtools)
 
-    def test_keep_intermediates_retains_bams_and_declares_unsorted_output(self) -> None:
+    def test_keep_intermediates_retains_collated_checkpoint_and_sort_scratch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             args, fake_bin = prepare_run(root, paired=False)
@@ -618,8 +702,13 @@ class ExecutionTests(unittest.TestCase):
                 0,
             )
             output = root / "out"
-            unsorted = output / "intermediate" / "alignment" / "sample_01.unsorted.bam"
-            self.assertTrue(unsorted.is_file())
+            checkpoint = (
+                output
+                / "intermediate"
+                / "alignment"
+                / "sample_01.name-collated.bam"
+            )
+            self.assertTrue(checkpoint.is_file())
             scratch = (
                 output
                 / "intermediate"
@@ -634,14 +723,16 @@ class ExecutionTests(unittest.TestCase):
                     for path in scratch.iterdir()
                     if path.suffix == ".bam"
                 },
-                {"name-collated.bam", "fixmate.bam", "coordinate.bam", "marked.bam"},
+                {"coordinate.bam"},
             )
             manifest = json.loads((output / "output_manifest.json").read_text())
             align_outputs = [
                 entry for entry in manifest["outputs"] if entry["phase"] == "align"
             ]
             self.assertEqual(len(align_outputs), 1)
-            self.assertEqual(Path(align_outputs[0]["path"]).resolve(), unsorted.resolve())
+            self.assertEqual(
+                Path(align_outputs[0]["path"]).resolve(), checkpoint.resolve()
+            )
 
             analysis_calls = {
                 tool: tool_counts(counter)[tool]
@@ -671,7 +762,7 @@ class ExecutionTests(unittest.TestCase):
                 },
                 analysis_calls,
             )
-            self.assertFalse(unsorted.exists())
+            self.assertFalse(checkpoint.exists())
             self.assertFalse(scratch.exists())
             manifest = json.loads((output / "output_manifest.json").read_text())
             self.assertNotIn(
