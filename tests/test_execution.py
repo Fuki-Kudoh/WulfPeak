@@ -14,7 +14,14 @@ from wulfpeak.cli import main
 
 
 INDEX_SUFFIXES = (".1", ".2", ".3", ".4", ".rev.1", ".rev.2")
-IMPLEMENTED_TOOLS = ("fastqc", "trim_galore", "bowtie2", "samtools", "bamCoverage")
+IMPLEMENTED_TOOLS = (
+    "fastqc",
+    "trim_galore",
+    "bowtie2",
+    "samtools",
+    "bamCoverage",
+    "multiqc",
+)
 
 
 @contextlib.contextmanager
@@ -167,6 +174,22 @@ if name == "bamCoverage":
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_bytes(b"bad!" if invalid else b"\x26\xfc\x8f\x88synthetic\n")
     raise SystemExit(11 if fail else 0)
+
+if name == "multiqc":
+    destination = Path(option("--outdir"))
+    destination.mkdir(parents=True, exist_ok=True)
+    (destination / "multiqc_report.html").write_text(
+        "" if invalid else "<!doctype html><html>synthetic MultiQC</html>\n",
+        encoding="utf-8",
+    )
+    if not invalid:
+        data = destination / "multiqc_data"
+        data.mkdir()
+        (data / "multiqc_data.json").write_text("{}\n", encoding="utf-8")
+        (destination / "multiqc_sources.txt").write_text(
+            "synthetic companion\n", encoding="utf-8"
+        )
+    raise SystemExit(12 if fail else 0)
 
 raise SystemExit(2)
 '''
@@ -327,7 +350,8 @@ class ExecutionTests(unittest.TestCase):
                     (phase, sample_id)
                     for phase in expected_phases
                     for sample_id in ("sample_01", "sample_02")
-                ],
+                ]
+                + [("multiqc", "run")],
             )
 
             state = json.loads((output / "status" / "state.json").read_text())
@@ -371,7 +395,7 @@ class ExecutionTests(unittest.TestCase):
             final_state = json.loads(
                 (output / "status" / "state.json").read_text()
             )
-            self.assertEqual(len(final_state["steps"]), 12)
+            self.assertEqual(len(final_state["steps"]), 13)
             self.assertEqual(
                 {step["status"] for step in final_state["steps"].values()},
                 {"done"},
@@ -458,6 +482,7 @@ class ExecutionTests(unittest.TestCase):
                 "fastqc_raw", "trim", "fastqc_trimmed", "bam_process", "coverage"
             })
             self.assertTrue((output / "bigwig" / "sample_01.normalized.bw").is_file())
+            self.assertNotIn("multiqc", tool_counts(root / "calls.log"))
             self.assertFalse(
                 (
                     output
@@ -484,6 +509,179 @@ class ExecutionTests(unittest.TestCase):
                 self.assertEqual(
                     main(["validate-outputs", "--output-dir", str(output)]), 0
                 )
+
+    def test_default_executes_pipeline_multiqc_and_promotes_complete_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args, fake_bin = prepare_two_sample_run(root)
+            counter = root / "calls.log"
+
+            code, error = run_with_tools(args, fake_bin, counter=counter)
+            self.assertEqual(code, 0, error)
+
+            output = root / "out"
+            plan = json.loads(
+                (output / "config" / "command_plan.json").read_text()
+            )
+            multiqc_steps = [
+                step for step in plan["steps"] if step["phase"] == "multiqc"
+            ]
+            self.assertEqual(len(multiqc_steps), 1)
+            self.assertEqual(
+                (multiqc_steps[0]["scope"], multiqc_steps[0]["scope_id"]),
+                ("pipeline", "run"),
+            )
+            self.assertEqual(
+                [(step["phase"], step["scope_id"]) for step in plan["steps"][-3:]],
+                [
+                    ("coverage", "sample_01"),
+                    ("coverage", "sample_02"),
+                    ("multiqc", "run"),
+                ],
+            )
+            self.assertTrue((output / "multiqc" / "multiqc_report.html").is_file())
+            self.assertTrue((output / "multiqc" / "multiqc_data").is_dir())
+            self.assertTrue((output / "multiqc" / "multiqc_sources.txt").is_file())
+            self.assertEqual(tool_counts(counter)["multiqc"], 1)
+
+            metadata = json.loads(
+                (output / "metadata" / "run_metadata.json").read_text()
+            )
+            self.assertEqual(metadata["completed_through"], "multiqc")
+            manifest = json.loads((output / "output_manifest.json").read_text())
+            self.assertEqual(manifest["completed_through"], "multiqc")
+            self.assertTrue(
+                any(
+                    entry["phase"] == "multiqc"
+                    and entry["kind"] == "directory"
+                    and entry["validated"]
+                    for entry in manifest["outputs"]
+                )
+            )
+
+            status = json.loads(
+                (output / "status" / "state.json").read_text()
+            )
+            self.assertEqual(status["steps"]["pipeline:run:multiqc"]["status"], "done")
+            status_stdout = io.StringIO()
+            with contextlib.redirect_stdout(status_stdout):
+                self.assertEqual(main(["status", "--output-dir", str(output)]), 0)
+            self.assertIn("multiqc:", status_stdout.getvalue())
+            self.assertIn("1/1", status_stdout.getvalue())
+
+            code, error = run_with_tools(
+                [*args, "--stop-after", "multiqc"], fake_bin, counter=counter
+            )
+            self.assertEqual(code, 0, error)
+            self.assertEqual(tool_counts(counter)["multiqc"], 1)
+
+    def test_multiqc_failure_resumes_only_multiqc(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args, fake_bin = prepare_two_sample_run(root)
+            counter = root / "calls.log"
+
+            code, error = run_with_tools(
+                args, fake_bin, counter=counter, fail="multiqc"
+            )
+            self.assertEqual(code, 3)
+            self.assertIn("Step multiqc failed for pipeline run", error)
+            failed_counts = tool_counts(counter)
+            failed_samtools = samtools_analysis_calls(counter)
+            state = json.loads(
+                (root / "out" / "status" / "state.json").read_text()
+            )
+            self.assertEqual(
+                state["steps"]["pipeline:run:multiqc"]["status"], "failed"
+            )
+            self.assertEqual(
+                sum(
+                    item["status"] == "done"
+                    for key, item in state["steps"].items()
+                    if key.endswith(":coverage")
+                ),
+                2,
+            )
+
+            status_stdout = io.StringIO()
+            with contextlib.redirect_stdout(status_stdout):
+                self.assertEqual(
+                    main(["status", "--output-dir", str(root / "out")]), 0
+                )
+            failed_status = status_stdout.getvalue()
+            self.assertIn("phase: multiqc", failed_status)
+            self.assertIn("multiqc:", failed_status)
+            self.assertIn("0/1", failed_status)
+            self.assertIn("pipeline  multiqc", failed_status)
+
+            code, error = run_with_tools(args, fake_bin, counter=counter)
+            self.assertEqual(code, 0, error)
+            resumed_counts = tool_counts(counter)
+            for tool in ("fastqc", "trim_galore", "bowtie2", "bamCoverage"):
+                self.assertEqual(resumed_counts[tool], failed_counts[tool])
+            self.assertEqual(samtools_analysis_calls(counter), failed_samtools)
+            self.assertEqual(resumed_counts["multiqc"], failed_counts["multiqc"] + 1)
+
+    def test_multiqc_barrier_blocks_when_any_coverage_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args, fake_bin = prepare_two_sample_run(root)
+            counter = root / "calls.log"
+
+            code, error = run_with_tools(
+                args,
+                fake_bin,
+                counter=counter,
+                fail="bamCoverage",
+                fail_sample="sample_02",
+            )
+            self.assertEqual(code, 3)
+            self.assertIn("Step coverage failed for sample sample_02", error)
+            self.assertNotIn("multiqc", tool_counts(counter))
+            state = json.loads(
+                (root / "out" / "status" / "state.json").read_text()
+            )
+            self.assertNotIn("pipeline:run:multiqc", state["steps"])
+
+    def test_multiqc_preflight_depends_on_selected_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args, fake_bin = prepare_run(root, paired=False)
+            (fake_bin / "multiqc").unlink()
+            counter = root / "calls.log"
+
+            code, error = run_with_tools(
+                [*args, "--stop-after", "coverage"],
+                fake_bin,
+                counter=counter,
+            )
+            self.assertEqual(code, 0, error)
+            code, error = run_with_tools(args, fake_bin, counter=counter)
+            self.assertEqual(code, 2)
+            self.assertIn("multiqc", error)
+
+    def test_coverage_only_run_extends_to_multiqc_without_rebuilding_samples(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args, fake_bin = prepare_two_sample_run(root)
+            counter = root / "calls.log"
+
+            code, error = run_with_tools(
+                [*args, "--stop-after", "coverage"],
+                fake_bin,
+                counter=counter,
+            )
+            self.assertEqual(code, 0, error)
+            coverage_counts = tool_counts(counter)
+            coverage_samtools = samtools_analysis_calls(counter)
+
+            code, error = run_with_tools(args, fake_bin, counter=counter)
+            self.assertEqual(code, 0, error)
+            extended_counts = tool_counts(counter)
+            for tool in ("fastqc", "trim_galore", "bowtie2", "bamCoverage"):
+                self.assertEqual(extended_counts[tool], coverage_counts[tool])
+            self.assertEqual(samtools_analysis_calls(counter), coverage_samtools)
+            self.assertEqual(extended_counts["multiqc"], 1)
 
     def test_paired_end_executes_and_reruns_nonempty_fastqc_directories(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

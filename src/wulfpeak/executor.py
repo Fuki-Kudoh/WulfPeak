@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .atomic import atomic_write_text
 from .command import CommandRunner
-from .plan_schema import promote_file_artifact
+from .plan_schema import promote_artifact
 from .validators import validate_artifact
 
 
@@ -71,7 +71,7 @@ class StepExecutor:
                 + "\n".join(f"  - {failure}" for failure in failures)
             )
         for artifact in artifacts:
-            promote_file_artifact(artifact, validated=True)
+            promote_artifact(artifact, validated=True)
 
     def _run_internal(self, action: dict[str, object]) -> None:
         operation = action.get("operation")
@@ -136,7 +136,11 @@ def reset_step_temporary(output_dir: Path, step: dict[str, object]) -> Path:
     scope = str(step["scope"])
     scope_id = str(step["scope_id"])
     phase = str(step["phase"])
-    scope_dir = "samples" if scope == "sample" else "groups"
+    scope_dir = {"sample": "samples", "group": "groups", "pipeline": "pipeline"}.get(
+        scope
+    )
+    if scope_dir is None:
+        raise ValueError(f"unsupported step scope: {scope!r}")
     temporary = output_dir / "intermediate" / ".steps" / scope_dir / scope_id / phase
     if temporary.exists():
         shutil.rmtree(temporary)

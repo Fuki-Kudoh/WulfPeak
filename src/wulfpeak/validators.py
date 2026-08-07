@@ -134,11 +134,31 @@ def validate_path(
     validator: str | None = None,
     samtools: str | Path | None = None,
 ) -> ValidationResult:
+    selected = validator or kind
+    if selected == "multiqc_output" or kind == "directory":
+        checks: dict[str, object] = {
+            "exists": path.exists(),
+            "directory": path.is_dir(),
+        }
+        if not path.is_dir():
+            return ValidationResult(False, checks)
+        report = path / "multiqc_report.html"
+        data = path / "multiqc_data"
+        checks.update(
+            {
+                "report_exists": report.is_file(),
+                "report_size": report.stat().st_size if report.is_file() else 0,
+                "data_exists": data.is_dir(),
+            }
+        )
+        return ValidationResult(
+            bool(checks["report_size"]) and bool(checks["data_exists"]), checks
+        )
+
     checks, size = _regular_file_checks(path)
     if size is None:
         return ValidationResult(False, checks)
 
-    selected = validator or kind
     warnings: list[str] = []
     if selected in {
         "narrowPeak_or_empty",

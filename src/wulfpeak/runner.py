@@ -1,4 +1,4 @@
-"""Preflight, planning, and phase-major execution through coverage."""
+"""Preflight, planning, and phase-major execution through MultiQC."""
 
 from __future__ import annotations
 
@@ -206,6 +206,34 @@ def _step_signature(
             "step": step,
             "inputs": fingerprints,
             "upstream_signature": upstream_signature,
+            # MultiQC is downstream of every sample step. Excluding it here
+            # preserves coverage-era sample signatures when a coverage-only
+            # run is later extended through the MultiQC boundary.
+            "tools": {
+                name: metadata
+                for name, metadata in _tool_metadata(result).items()
+                if name != "multiqc"
+            },
+        }
+    )
+
+
+def _pipeline_step_signature(
+    step: dict[str, object],
+    result: PreflightResult,
+    *,
+    upstream_signatures: dict[str, str | None],
+) -> str:
+    """Sign a pipeline step from every sample's deterministic upstream chain."""
+
+    return canonical_signature(
+        {
+            "signature_schema": 2,
+            "step": step,
+            "upstream_signatures": {
+                sample_id: upstream_signatures[sample_id]
+                for sample_id in sorted(upstream_signatures)
+            },
             "tools": _tool_metadata(result),
         }
     )
@@ -341,10 +369,10 @@ def _write_output_manifest(
 
 
 def prepare_run(config: RunConfig, argv: list[str]) -> tuple[Path, Path, Path]:
-    selected_stop = config.stop_after or (None if config.dry_run else "coverage")
-    if not config.dry_run and selected_stop != "coverage":
+    selected_stop = config.stop_after or (None if config.dry_run else "multiqc")
+    if not config.dry_run and selected_stop not in {"coverage", "multiqc"}:
         raise ConfigurationError(
-            "non-dry-run execution must resolve to --stop-after coverage"
+            "non-dry-run execution must resolve to --stop-after coverage or multiqc"
         )
 
     with RunLock(config.output_dir, argv):
@@ -429,9 +457,107 @@ def prepare_run(config: RunConfig, argv: list[str]) -> tuple[Path, Path, Path]:
         write_pipeline_status(config.output_dir, "running")
         try:
             for step in plan["steps"]:
-                if not isinstance(step, dict) or step.get("scope") != "sample":
+                if not isinstance(step, dict):
+                    raise CommandExecutionError("Command plan contains a malformed step")
+                if step.get("scope") == "pipeline":
+                    phase = str(step["phase"])
+                    scope_id = str(step["scope_id"])
+                    if phase != "multiqc":
+                        raise CommandExecutionError(
+                            f"The {selected_stop} execution boundary does not support "
+                            f"pipeline phase {phase}"
+                        )
+                    signature = _pipeline_step_signature(
+                        step,
+                        result,
+                        upstream_signatures=upstream_signatures,
+                    )
+                    log_path = config.output_dir / "logs" / "pipeline" / f"{phase}.log"
+                    output_ids = _artifact_ids(step)
+                    forced = (
+                        force_index is not None and PHASES.index(phase) >= force_index
+                    )
+                    state = states.get(_state_id(step))
+                    reusable = (
+                        config.resume
+                        and not forced
+                        and can_reuse_step(
+                            state,
+                            signature,
+                            outputs_valid=_outputs_valid(step, samtools=samtools),
+                            upstream_reusable=all(chain_unchanged.values()),
+                        )
+                    )
+                    if reusable:
+                        continue
+
+                    reset_step_temporary(config.output_dir, step)
+                    step_started = _now()
+                    running = StepState(
+                        phase,
+                        "running",
+                        signature=signature,
+                        started_at=step_started,
+                        log_path=str(log_path),
+                        output_ids=output_ids,
+                    )
+                    write_step_state(
+                        config.output_dir,
+                        running,
+                        scope="pipeline",
+                        scope_id=scope_id,
+                    )
+                    try:
+                        executor.execute(step, log_path)
+                    except BaseException as exc:
+                        failed = StepState(
+                            phase,
+                            "failed",
+                            signature=signature,
+                            started_at=step_started,
+                            finished_at=_now(),
+                            exit_code=(
+                                exc.returncode
+                                if isinstance(exc, CommandExecutionError)
+                                and exc.returncode is not None
+                                else 1
+                            ),
+                            log_path=str(log_path),
+                            output_ids=output_ids,
+                            last_error=str(exc),
+                        )
+                        write_step_state(
+                            config.output_dir,
+                            failed,
+                            scope="pipeline",
+                            scope_id=scope_id,
+                        )
+                        raise CommandExecutionError(
+                            f"Step {phase} failed for pipeline {scope_id}: {exc}"
+                        ) from exc
+                    done = StepState(
+                        phase,
+                        "done",
+                        signature=signature,
+                        started_at=step_started,
+                        finished_at=_now(),
+                        exit_code=0,
+                        log_path=str(log_path),
+                        output_ids=output_ids,
+                    )
+                    write_step_state(
+                        config.output_dir,
+                        done,
+                        scope="pipeline",
+                        scope_id=scope_id,
+                    )
+                    states[_state_id(step)] = done
+                    continue
+
+                if step.get("scope") != "sample":
                     raise CommandExecutionError(
-                        "The coverage execution boundary only supports sample steps"
+                        f"The {selected_stop} execution boundary only supports "
+                        "sample and pipeline steps"
                     )
                 sample_id = str(step["scope_id"])
                 phase = str(step["phase"])
@@ -541,7 +667,7 @@ def prepare_run(config: RunConfig, argv: list[str]) -> tuple[Path, Path, Path]:
                     _cleanup_sample_intermediates(config, sample_id, states)
 
             _write_output_manifest(
-                config, plan, samtools=samtools, completed_through="coverage"
+                config, plan, samtools=samtools, completed_through=str(selected_stop)
             )
         except BaseException:
             failed_at = _now()
@@ -571,7 +697,7 @@ def prepare_run(config: RunConfig, argv: list[str]) -> tuple[Path, Path, Path]:
                 plan_path,
                 started=started,
                 finished=finished,
-                completed_through="coverage",
+                completed_through=str(selected_stop),
             ),
         )
         return manifest_path, plan_path, metadata_path

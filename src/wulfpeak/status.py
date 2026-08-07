@@ -51,8 +51,9 @@ def write_pipeline_status(output_dir: str | Path, status: str) -> Path:
 def write_step_state(
     output_dir: str | Path, state: StepState, *, scope: str, scope_id: str
 ) -> None:
-    if scope not in {"samples", "groups"}:
-        raise ValueError("scope must be 'samples' or 'groups'")
+    state_scopes = {"samples": "sample", "groups": "group", "pipeline": "pipeline"}
+    if scope not in state_scopes:
+        raise ValueError("scope must be 'samples', 'groups', or 'pipeline'")
     output = Path(output_dir)
     status_path = output / "status" / scope / scope_id / f"{state.key}.status"
     state_path = output / "status" / "state.json"
@@ -60,7 +61,7 @@ def write_step_state(
         payload = json.loads(state_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         payload = {"steps": {}}
-    step_id = f"{scope[:-1]}:{scope_id}:{state.key}"
+    step_id = f"{state_scopes[scope]}:{scope_id}:{state.key}"
     payload.setdefault("steps", {})[step_id] = asdict(state)
     # Both files use the same atomic helper; JSON is replaced before the compact marker.
     atomic_write_json(state_path, payload)
@@ -113,21 +114,32 @@ def read_status(output_dir: str | Path) -> dict[str, object]:
         planned_steps = plan_payload.get("steps", [])
         if isinstance(planned_steps, list):
             for step in planned_steps:
-                if not isinstance(step, dict) or step.get("scope") != "sample":
+                if not isinstance(step, dict):
                     continue
+                scope = step.get("scope")
                 phase = step.get("phase")
                 scope_id = step.get("scope_id")
-                if isinstance(phase, str) and isinstance(scope_id, str):
+                if (
+                    scope in {"sample", "group", "pipeline"}
+                    and isinstance(phase, str)
+                    and isinstance(scope_id, str)
+                ):
                     phase_step_ids.setdefault(phase, []).append(
-                        f"sample:{scope_id}:{phase}"
+                        f"{scope}:{scope_id}:{phase}"
                     )
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         pass
     if not phase_step_ids and isinstance(steps, dict):
         for step_id, step in steps.items():
-            if not isinstance(step_id, str) or not step_id.startswith("sample:"):
+            if not isinstance(step_id, str):
                 continue
-            if not isinstance(step, dict) or not isinstance(step.get("key"), str):
+            parts = step_id.split(":", 2)
+            if (
+                len(parts) != 3
+                or parts[0] not in {"sample", "group", "pipeline"}
+                or not isinstance(step, dict)
+                or not isinstance(step.get("key"), str)
+            ):
                 continue
             phase_step_ids.setdefault(str(step["key"]), []).append(step_id)
 
@@ -159,13 +171,16 @@ def read_status(output_dir: str | Path) -> dict[str, object]:
             if not isinstance(step_id, str) or not isinstance(step, dict):
                 continue
             parts = step_id.split(":", 2)
-            if len(parts) != 3 or parts[0] != "sample":
+            if len(parts) != 3 or parts[0] not in {"sample", "group", "pipeline"}:
                 continue
-            detail = {
-                "sample_id": parts[1],
+            detail: dict[str, object] = {
                 "phase": parts[2],
                 "started_at": step.get("started_at"),
             }
+            if parts[0] == "sample":
+                detail["sample_id"] = parts[1]
+            else:
+                detail.update({"scope": parts[0], "scope_id": parts[1]})
             if step.get("status") == "running":
                 running.append(detail)
             elif step.get("status") == "failed":
@@ -174,7 +189,7 @@ def read_status(output_dir: str | Path) -> dict[str, object]:
     def detail_key(detail: dict[str, object]) -> tuple[int, str]:
         return (
             phase_rank.get(str(detail["phase"]), len(phase_rank)),
-            str(detail["sample_id"]),
+            str(detail.get("sample_id", detail.get("scope_id", ""))),
         )
 
     running.sort(key=detail_key)

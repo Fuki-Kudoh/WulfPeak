@@ -1,9 +1,10 @@
 # WulfPeak
 
 WulfPeak uses a compact samplesheet and exact, non-recursive FASTQ discovery.
-The v0.2.0 implementation supports paired-end (default) and single-end input
+The v0.2.1 implementation supports paired-end (default) and single-end input
 validation, deterministic command plans, status inspection, conservative
-resume, and real per-sample execution through normalized bigWig coverage.
+resume, real per-sample execution through normalized BigWig coverage, and a
+pipeline-scoped MultiQC report after all samples complete coverage.
 
 ## Samplesheet
 
@@ -94,10 +95,11 @@ Downstream steps consume these manifest paths rather than reconstructing names.
 
 ## Validate and plan a run
 
-The executables required for real execution through coverage must already be
-on `PATH`: FastQC, Trim Galore, Bowtie2, samtools, and deepTools
-`bamCoverage`. A complete dry-run plan additionally requires MACS3, bedtools,
-and MultiQC. WulfPeak does not install tools or load environment modules.
+The executables required for the default real execution through MultiQC must
+already be on `PATH`: FastQC, Trim Galore, Bowtie2, samtools, deepTools
+`bamCoverage`, and MultiQC. A run with `--stop-after coverage` does not require
+MultiQC. A complete dry-run plan additionally requires MACS3 and bedtools.
+WulfPeak does not install tools or load environment modules.
 
 ```console
 wulfpeak run \
@@ -127,14 +129,17 @@ against an existing output directory preserves all completed and failed state.
 
 Each planned step has ordered `actions` and explicit `artifacts`. Commands that
 produce data on stdout declare an atomic `stdout_path`. Every artifact records
-a distinct step-temporary path, validator, canonical path, and
-`validate_then_atomic_file_replace` promotion. FastQC and MACS3 outputs are
-declared as individual files, so a forced rerun never replaces a non-empty
-parent directory. The consensus plan normalizes each
-replicate to merged BED3, records strict-majority support, merges qualifying
-segments, and declares both the canonical BED3 and support TSV outputs.
+a distinct step-temporary path, validator, canonical path, and promotion
+contract. Files use `validate_then_atomic_file_replace`. The complete MultiQC
+directory uses a validated, same-parent staged directory replacement, avoiding
+cross-filesystem rename assumptions and preventing partial reports from being
+promoted. FastQC and MACS3 outputs are declared as individual files, so a
+forced rerun never replaces a non-empty parent directory. The consensus plan
+normalizes each replicate to merged BED3, records strict-majority support,
+merges qualifying segments, and declares both the canonical BED3 and support
+TSV outputs.
 
-## Execute through coverage
+## Execute through MultiQC
 
 Omitting `--dry-run` executes all applicable samples in phase-major order, with
 a barrier between phases:
@@ -146,6 +151,7 @@ fastqc_trimmed:  all samples
 align:           all samples
 bam_process:     all samples
 coverage:        all samples
+multiqc:         pipeline
 ```
 
 A later phase never starts until the current phase has completed for every
@@ -162,10 +168,13 @@ uses no additional samtools workers, although a streaming pipeline still
 requires its two main processes. The resolved allocation is recorded in
 `command_plan.json` as `thread_allocation`.
 
-`--stop-after` defaults to `coverage` for a real run. This release accepts
-only that real execution boundary; a later stop such as `peak` fails before
-preflight. MACS3, pooled BAM, consensus, MultiQC, and reporting actions remain
-plan-only and are never executed by this slice.
+`--stop-after` defaults to `multiqc` for a real run. Use `--stop-after coverage`
+to stop before consolidated reporting, or `--stop-after multiqc` explicitly for
+the default v0.2.1 boundary. A later stop such as `peak` fails before preflight.
+MACS3 peak calling, pooled BAMs, pooled and consensus peaks, and the final
+WulfPeak `report` phase remain plan-only and are never executed by this release.
+The final `report` phase is distinct from MultiQC and remains reserved for a
+future WulfPeak run summary.
 
 Each step writes into its owned temporary directory. All temporary artifacts
 must pass their declared validators before any artifact in the step is
@@ -176,7 +185,10 @@ Resume is enabled by default. A step is reused only when its prior state is
 `done`, its signature still matches the plan, tool provenance, options, and
 direct input fingerprints, every retained canonical output validates, and its
 upstream chain was also reusable. Use `--force-from PHASE` to rebuild that
-phase and everything after it, or `--no-resume` to rebuild all six phases.
+phase and everything after it, or `--no-resume` to rebuild all implemented
+phases. MultiQC is signed from every sample's coverage chain: a failed MultiQC
+step resumes without rebuilding BAMs or BigWigs, while rebuilt upstream
+coverage invalidates MultiQC normally.
 
 Alignment streams directly from Bowtie2 into a name-collated BAM, which is the
 resumable alignment checkpoint. BAM processing streams `fixmate` into `sort`
@@ -189,9 +201,21 @@ alignment checkpoint when BAM processing must rerun. Pass `--keep-intermediates`
 to retain the collated checkpoint and coordinate-sort scratch; the checkpoint
 is then included in `output_manifest.json`.
 
-A successful real run writes `output_manifest.json` only for artifacts through
-coverage, records `dry_run: false` and `completed_through: coverage` in run
-metadata, and sets the pipeline plus all six per-sample step states to `done`.
+Normalized BigWig generation remains the responsibility of `coverage`; v0.2.1
+does not change that processing. It adds consolidated QC reporting from the
+FastQC, Trim Galore, and samtools outputs already present under the WulfPeak
+output root. A successful default run preserves the standard MultiQC outputs:
+
+```text
+multiqc/
+├── multiqc_report.html
+└── multiqc_data/
+```
+
+Other standard MultiQC companion files are preserved as well. A successful
+default real run records `dry_run: false` and `completed_through: multiqc` in
+run metadata and `output_manifest.json`, sets all six per-sample step states to
+`done`, and records the single pipeline-scoped MultiQC step as `done`.
 
 ## Inspect state and outputs
 
@@ -203,12 +227,15 @@ wulfpeak status --output-dir WulfPeak_out --json
 ```
 
 The human-readable status includes the current phase, completed/total counts
-for each planned sample phase, and details for any running or failed sample.
+for each planned phase, and details for running or failed work. Per-sample
+phases count against the number of samples; pipeline-scoped MultiQC is shown as
+`0/1` or `1/1` and its detail is identified as `pipeline`, not as a sample.
 
 `wulfpeak validate-outputs` validates an existing `output_manifest.json`
 without rerunning analysis. Validation checks gzip FASTQ structure, FastQC
 HTML and ZIP integrity, final BAMs with `samtools quickcheck`, BAM indexes,
-non-empty QC text, and bigWig magic bytes. Because BAM validation is explicit,
+non-empty QC text, BigWig magic bytes, and the MultiQC report/data directory.
+Because BAM validation is explicit,
 `samtools` must be available when a manifest contains BAM artifacts.
 
 ## Development
