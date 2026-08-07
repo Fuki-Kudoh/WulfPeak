@@ -1,4 +1,4 @@
-"""Read and validate the compact WulfPeak v0.1.0 samplesheet."""
+"""Read and validate the compact WulfPeak v0.2.0 samplesheet."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 class SamplesheetValidationError(ValueError):
-    """Raised when a samplesheet violates the v0.1.0 contract."""
+    """Raised when a samplesheet violates the v0.2.0 contract."""
 
     def __init__(self, errors: list[str]):
         self.errors = errors
@@ -60,7 +60,7 @@ def _parse_qvalue(value: str) -> Decimal | None:
 
 
 def load_samplesheet(path: str | Path) -> list[Sample]:
-    """Load a tab-separated samplesheet and enforce the v0.1.0 schema."""
+    """Load a tab-separated samplesheet and enforce the v0.2.0 schema."""
 
     samplesheet = Path(path)
     errors: list[str] = []
@@ -79,7 +79,7 @@ def load_samplesheet(path: str | Path) -> list[Sample]:
             errors.append(f"missing required columns: {', '.join(missing)}")
         if extra:
             errors.append(
-                "unsupported columns in v0.1.0: " + ", ".join(extra)
+                "unsupported columns in v0.2.0: " + ", ".join(extra)
             )
         if duplicate_columns:
             errors.append(

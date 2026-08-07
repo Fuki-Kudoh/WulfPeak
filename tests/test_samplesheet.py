@@ -60,7 +60,7 @@ class SamplesheetTests(unittest.TestCase):
     def test_requires_exact_column_set(self) -> None:
         cases = (
             (REQUIRED_COLUMNS[:-1], "missing required columns: qvalue"),
-            (REQUIRED_COLUMNS + ("fastq1",), "unsupported columns in v0.1.0: fastq1"),
+            (REQUIRED_COLUMNS + ("fastq1",), "unsupported columns in v0.2.0: fastq1"),
         )
         for columns, message in cases:
             with self.subTest(columns=columns):
