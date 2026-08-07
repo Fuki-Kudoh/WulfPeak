@@ -44,7 +44,7 @@ def make_index(prefix: Path) -> None:
         Path(f"{prefix}{suffix}.bt2").write_bytes(b"index")
 
 
-def run_args(root: Path, *, single_end: bool) -> list[str]:
+def run_args(root: Path, *, single_end: bool, threads: int = 4) -> list[str]:
     args = [
         "run",
         "--samplesheet",
@@ -62,7 +62,7 @@ def run_args(root: Path, *, single_end: bool) -> list[str]:
         "--effective-genome-size",
         "1000000",
         "--threads",
-        "4",
+        str(threads),
         "--dry-run",
     ]
     if single_end:
@@ -78,6 +78,10 @@ def command_argvs(step: dict[str, object]) -> list[list[str]]:
         elif action["type"] == "pipeline":
             commands.extend(command["argv"] for command in action["commands"])
     return commands
+
+
+def option_value(argv: list[str], option: str) -> str:
+    return argv[argv.index(option) + 1]
 
 
 class RunCliTests(unittest.TestCase):
@@ -158,6 +162,84 @@ class RunCliTests(unittest.TestCase):
                 "null",
             )
 
+    def test_command_plan_allocates_concurrent_pipeline_thread_budgets(self) -> None:
+        expected_allocations = {
+            1: (1, 0, 0, 0),
+            2: (1, 0, 0, 1),
+            6: (5, 0, 4, 5),
+            12: (9, 2, 10, 11),
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_bin = self.prepare(root)
+            (root / "samples.tsv").write_text(
+                "input_id\tsample_id\tgroup_id\tpeak_type\tcontrol\tqvalue\n"
+                "raw_treat_01\ttreat_rep1\tfactor_A\tnarrow\t.\t0.01\n",
+                encoding="utf-8",
+            )
+            (root / "fastq" / "raw_treat_01.fastq.gz").write_bytes(b"synthetic")
+            selected_path = f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}"
+
+            for budget, expected in expected_allocations.items():
+                with self.subTest(budget=budget), environment(
+                    "PATH", selected_path
+                ), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(
+                        main(run_args(root, single_end=True, threads=budget)), 0
+                    )
+                plan = json.loads(
+                    (root / "out" / "config" / "command_plan.json").read_text()
+                )
+                bowtie2_threads, collate_workers, sort_workers, samtools_workers = (
+                    expected
+                )
+                self.assertEqual(
+                    plan["thread_allocation"],
+                    {
+                        "budget": budget,
+                        "bowtie2_threads": bowtie2_threads,
+                        "collate_workers": collate_workers,
+                        "sort_workers": sort_workers,
+                        "samtools_workers": samtools_workers,
+                    },
+                )
+                self.assertEqual(
+                    bowtie2_threads + 1 + collate_workers,
+                    max(2, budget),
+                )
+                self.assertEqual(1 + 1 + sort_workers, max(2, budget))
+
+                align = next(
+                    step for step in plan["steps"] if step["phase"] == "align"
+                )
+                align_commands = command_argvs(align)
+                self.assertEqual(
+                    option_value(align_commands[0], "-p"), str(bowtie2_threads)
+                )
+                self.assertEqual(
+                    option_value(align_commands[1], "-@"), str(collate_workers)
+                )
+
+                bam = next(
+                    step
+                    for step in plan["steps"]
+                    if step["phase"] == "bam_process"
+                )
+                bam_commands = command_argvs(bam)
+                by_subcommand = {
+                    command[1]: command
+                    for command in bam_commands
+                    if len(command) > 1
+                }
+                self.assertEqual(
+                    option_value(by_subcommand["sort"], "-@"), str(sort_workers)
+                )
+                for subcommand in ("index", "flagstat", "stats"):
+                    self.assertEqual(
+                        option_value(by_subcommand[subcommand], "-@"),
+                        str(samtools_workers),
+                    )
+
     def test_paired_end_dry_run_plans_control_and_replicates(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -216,6 +298,28 @@ class RunCliTests(unittest.TestCase):
             bam_step = next(
                 step for step in plan["steps"] if step["phase"] == "bam_process"
             )
+            align_commands = command_argvs(align)
+            self.assertEqual(align_commands[1][1], "collate")
+            self.assertTrue(
+                align["artifacts"][0]["canonical_path"].endswith(
+                    ".name-collated.bam"
+                )
+            )
+            bam_pipelines = [
+                action
+                for action in bam_step["actions"]
+                if action["type"] == "pipeline"
+            ]
+            self.assertEqual(
+                [
+                    [command["argv"][1] for command in action["commands"]]
+                    for action in bam_pipelines
+                ],
+                [["fixmate", "sort"], ["markdup", "view"]],
+            )
+            serialized_bam_plan = json.dumps(bam_step)
+            for forbidden in ("unsorted.bam", "fixmate.bam", "marked.bam"):
+                self.assertNotIn(forbidden, serialized_bam_plan)
             for tool_name in ("flagstat", "stats", "idxstats"):
                 action = next(
                     action

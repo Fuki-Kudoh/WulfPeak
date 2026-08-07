@@ -264,6 +264,61 @@ class FoundationTests(unittest.TestCase):
                 "done",
             )
 
+    def test_status_summarizes_current_phase_and_planned_sample_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            (output / "config").mkdir()
+            (output / "config" / "command_plan.json").write_text(
+                json.dumps(
+                    {
+                        "steps": [
+                            {"scope": "sample", "scope_id": sample, "phase": phase}
+                            for phase in ("trim", "align")
+                            for sample in ("s1", "s2")
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            write_pipeline_status(output, "running")
+            write_step_state(
+                output,
+                StepState("trim", "done", signature="s1-trim"),
+                scope="samples",
+                scope_id="s1",
+            )
+            write_step_state(
+                output,
+                StepState(
+                    "trim",
+                    "running",
+                    signature="s2-trim",
+                    started_at="2026-08-07T00:00:00+00:00",
+                ),
+                scope="samples",
+                scope_id="s2",
+            )
+
+            payload = read_status(output)
+            self.assertEqual(payload["phase"], "trim")
+            self.assertEqual(
+                payload["phase_counts"],
+                {
+                    "trim": {"completed": 1, "total": 2},
+                    "align": {"completed": 0, "total": 2},
+                },
+            )
+            self.assertEqual(
+                payload["running"],
+                [
+                    {
+                        "sample_id": "s2",
+                        "phase": "trim",
+                        "started_at": "2026-08-07T00:00:00+00:00",
+                    }
+                ],
+            )
+
     def test_done_status_exposes_invalid_outputs_without_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)

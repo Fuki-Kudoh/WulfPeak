@@ -136,11 +136,31 @@ segments, and declares both the canonical BED3 and support TSV outputs.
 
 ## Execute through coverage
 
-Omitting `--dry-run` executes these phases independently for each sample:
+Omitting `--dry-run` executes all applicable samples in phase-major order, with
+a barrier between phases:
 
 ```text
-fastqc_raw -> trim -> fastqc_trimmed -> align -> bam_process -> coverage
+fastqc_raw:      all samples
+trim:            all samples
+fastqc_trimmed:  all samples
+align:           all samples
+bam_process:     all samples
+coverage:        all samples
 ```
+
+A later phase never starts until the current phase has completed for every
+applicable sample. Execution remains fail-fast: one sample failure stops the
+run, and resume skips reusable completed samples in that phase before
+continuing from failed or incomplete work.
+
+`--threads` is an approximate per-sample CPU budget. Concurrent pipelines use
+a centralized allocation policy instead of assigning that full value to every
+process: alignment divides the budget between Bowtie2 and the samtools collate
+main/worker threads, while BAM processing reserves one main thread each for
+fixmate and sort and assigns the remainder to sort workers. A budget of one
+uses no additional samtools workers, although a streaming pipeline still
+requires its two main processes. The resolved allocation is recorded in
+`command_plan.json` as `thread_allocation`.
 
 `--stop-after` defaults to `coverage` for a real run. This release accepts
 only that real execution boundary; a later stop such as `peak` fails before
@@ -158,12 +178,16 @@ direct input fingerprints, every retained canonical output validates, and its
 upstream chain was also reusable. Use `--force-from PHASE` to rebuild that
 phase and everything after it, or `--no-resume` to rebuild all six phases.
 
-By default, WulfPeak removes the reproducible unsorted alignment BAM and
-samtools processing scratch BAMs after that sample completes coverage. These
-retired files are not required by `output_manifest.json`, and resume reuses
-their downstream validated BAM or regenerates alignment when BAM processing
-must rerun. Pass `--keep-intermediates` to retain the unsorted and scratch BAMs;
-the retained unsorted BAM is then included in the output manifest.
+Alignment streams directly from Bowtie2 into a name-collated BAM, which is the
+resumable alignment checkpoint. BAM processing streams `fixmate` into `sort`
+and `markdup` into the final filtering step, avoiding unsorted, fixmate, and
+marked BAM materializations. By default, WulfPeak removes the collated
+checkpoint and coordinate-sort scratch as soon as that sample completes
+`bam_process`; coverage failures therefore do not retain cohort-wide BAM
+scratch. Resume reuses the downstream validated final BAM or regenerates the
+alignment checkpoint when BAM processing must rerun. Pass `--keep-intermediates`
+to retain the collated checkpoint and coordinate-sort scratch; the checkpoint
+is then included in `output_manifest.json`.
 
 A successful real run writes `output_manifest.json` only for artifacts through
 coverage, records `dry_run: false` and `completed_through: coverage` in run
@@ -177,6 +201,9 @@ Status does not require FASTQ, index, or analysis tools:
 wulfpeak status --output-dir WulfPeak_out
 wulfpeak status --output-dir WulfPeak_out --json
 ```
+
+The human-readable status includes the current phase, completed/total counts
+for each planned sample phase, and details for any running or failed sample.
 
 `wulfpeak validate-outputs` validates an existing `output_manifest.json`
 without rerunning analysis. Validation checks gzip FASTQ structure, FastQC

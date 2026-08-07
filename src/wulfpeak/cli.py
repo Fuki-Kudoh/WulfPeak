@@ -6,6 +6,7 @@ import argparse
 import json
 import math
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import __version__
@@ -189,9 +190,57 @@ def _run_status(args: argparse.Namespace) -> int:
         print(json.dumps(payload, sort_keys=True))
     else:
         print(f"pipeline: {payload['pipeline_display']}")
-        for key, state in sorted(payload.get("steps", {}).items()):
-            print(f"{key}: {state.get('display_status', state.get('status', 'null'))}")
+        if payload.get("phase") is not None:
+            print(f"phase: {payload['phase']}")
+        phase_counts = payload.get("phase_counts", {})
+        if isinstance(phase_counts, dict) and phase_counts:
+            print()
+            label_width = max(len(str(phase)) for phase in phase_counts)
+            total_width = max(
+                len(str(counts.get("total", 0)))
+                for counts in phase_counts.values()
+                if isinstance(counts, dict)
+            )
+            for phase, counts in phase_counts.items():
+                if not isinstance(counts, dict):
+                    continue
+                completed = counts.get("completed", 0)
+                total = counts.get("total", 0)
+                print(
+                    f"{str(phase) + ':':<{label_width + 1}} "
+                    f"{completed:>{total_width}}/{total}"
+                )
+        for heading in ("running", "failed"):
+            details = payload.get(heading, [])
+            if not isinstance(details, list) or not details:
+                continue
+            print(f"\n{heading}:")
+            for detail in details:
+                if not isinstance(detail, dict):
+                    continue
+                suffix = ""
+                if heading == "running":
+                    suffix = f"  {_elapsed(detail.get('started_at'))}"
+                print(
+                    f"  {detail.get('sample_id', '?')}  "
+                    f"{detail.get('phase', '?')}{suffix}"
+                )
     return 0
+
+
+def _elapsed(started_at: object) -> str:
+    if not isinstance(started_at, str):
+        return "--:--:--"
+    try:
+        started = datetime.fromisoformat(started_at)
+    except ValueError:
+        return "--:--:--"
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    seconds = max(0, int((datetime.now(timezone.utc) - started).total_seconds()))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02}:{minutes:02}:{seconds:02}"
 
 
 def _run_validate_outputs(args: argparse.Namespace) -> int:

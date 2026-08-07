@@ -1,4 +1,4 @@
-"""Preflight, planning, and coverage-bound per-sample execution."""
+"""Preflight, planning, and phase-major execution through coverage."""
 
 from __future__ import annotations
 
@@ -168,7 +168,7 @@ def _sample_inputs(
     elif phase in {"fastqc_trimmed", "align"}:
         paths = [resolved.trimmed_fastq.r1, resolved.trimmed_fastq.r2]
     elif phase == "bam_process":
-        # The unsorted BAM is a transient materialization of the align step.
+        # The name-collated BAM is a transient materialization of the align step.
         # Its provenance is represented by the upstream step signature so it
         # may be retired after downstream completion without breaking resume.
         paths = []
@@ -259,15 +259,15 @@ def _cleanup_sample_intermediates(
     sample_id: str,
     states: dict[str, StepState],
 ) -> None:
-    """Retire reproducible BAM intermediates after successful coverage."""
+    """Retire reproducible BAM intermediates after successful BAM processing."""
 
-    unsorted = (
+    collated = (
         config.output_dir
         / "intermediate"
         / "alignment"
-        / f"{sample_id}.unsorted.bam"
+        / f"{sample_id}.name-collated.bam"
     )
-    unsorted.unlink(missing_ok=True)
+    collated.unlink(missing_ok=True)
     bam_scratch = (
         config.output_dir
         / "intermediate"
@@ -479,7 +479,7 @@ def prepare_run(config: RunConfig, argv: list[str]) -> tuple[Path, Path, Path]:
                 )
                 if reusable:
                     upstream_signatures[sample_id] = signature
-                    if phase == "coverage" and not config.keep_intermediates:
+                    if phase == "bam_process" and not config.keep_intermediates:
                         _cleanup_sample_intermediates(config, sample_id, states)
                     continue
 
@@ -537,7 +537,7 @@ def prepare_run(config: RunConfig, argv: list[str]) -> tuple[Path, Path, Path]:
                 )
                 states[_state_id(step)] = done
                 upstream_signatures[sample_id] = signature
-                if phase == "coverage" and not config.keep_intermediates:
+                if phase == "bam_process" and not config.keep_intermediates:
                     _cleanup_sample_intermediates(config, sample_id, states)
 
             _write_output_manifest(
