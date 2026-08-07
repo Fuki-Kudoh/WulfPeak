@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import IO
 
 from .atomic import atomic_write_json, atomic_write_text
+from .config import PHASES
 
 
 STATUS_VALUES = frozenset({"null", "running", "done", "failed"})
@@ -104,10 +105,103 @@ def read_status(output_dir: str | Path) -> dict[str, object]:
     pipeline_display = (
         "done (invalid output)" if pipeline == "done" and invalid_ids else pipeline
     )
+    phase_step_ids: dict[str, list[str]] = {}
+    try:
+        plan_payload = json.loads(
+            (output / "config" / "command_plan.json").read_text(encoding="utf-8")
+        )
+        planned_steps = plan_payload.get("steps", [])
+        if isinstance(planned_steps, list):
+            for step in planned_steps:
+                if not isinstance(step, dict) or step.get("scope") != "sample":
+                    continue
+                phase = step.get("phase")
+                scope_id = step.get("scope_id")
+                if isinstance(phase, str) and isinstance(scope_id, str):
+                    phase_step_ids.setdefault(phase, []).append(
+                        f"sample:{scope_id}:{phase}"
+                    )
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    if not phase_step_ids and isinstance(steps, dict):
+        for step_id, step in steps.items():
+            if not isinstance(step_id, str) or not step_id.startswith("sample:"):
+                continue
+            if not isinstance(step, dict) or not isinstance(step.get("key"), str):
+                continue
+            phase_step_ids.setdefault(str(step["key"]), []).append(step_id)
+
+    phase_order = sorted(
+        phase_step_ids,
+        key=lambda phase: (
+            PHASES.index(phase) if phase in PHASES else len(PHASES),
+            phase,
+        ),
+    )
+    phase_counts: dict[str, dict[str, int]] = {}
+    if isinstance(steps, dict):
+        for phase in phase_order:
+            step_ids = phase_step_ids[phase]
+            phase_counts[phase] = {
+                "completed": sum(
+                    1
+                    for step_id in step_ids
+                    if isinstance(steps.get(step_id), dict)
+                    and steps[step_id].get("display_status") == "done"
+                ),
+                "total": len(step_ids),
+            }
+
+    running: list[dict[str, object]] = []
+    failed: list[dict[str, object]] = []
+    if isinstance(steps, dict):
+        for step_id, step in steps.items():
+            if not isinstance(step_id, str) or not isinstance(step, dict):
+                continue
+            parts = step_id.split(":", 2)
+            if len(parts) != 3 or parts[0] != "sample":
+                continue
+            detail = {
+                "sample_id": parts[1],
+                "phase": parts[2],
+                "started_at": step.get("started_at"),
+            }
+            if step.get("status") == "running":
+                running.append(detail)
+            elif step.get("status") == "failed":
+                failed.append({**detail, "last_error": step.get("last_error")})
+    phase_rank = {phase: index for index, phase in enumerate(phase_order)}
+    def detail_key(detail: dict[str, object]) -> tuple[int, str]:
+        return (
+            phase_rank.get(str(detail["phase"]), len(phase_rank)),
+            str(detail["sample_id"]),
+        )
+
+    running.sort(key=detail_key)
+    failed.sort(key=detail_key)
+
+    current_phase: str | None = None
+    if running:
+        current_phase = str(running[0]["phase"])
+    elif pipeline == "failed" and failed:
+        current_phase = str(failed[0]["phase"])
+    elif pipeline in {"running", "failed"}:
+        current_phase = next(
+            (
+                phase
+                for phase, counts in phase_counts.items()
+                if counts["completed"] < counts["total"]
+            ),
+            None,
+        )
     return {
         "output_dir": str(output),
         "pipeline": pipeline,
         "pipeline_display": pipeline_display,
+        "phase": current_phase,
+        "phase_counts": phase_counts,
+        "running": running,
+        "failed": failed,
         **state,
     }
 

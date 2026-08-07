@@ -1,7 +1,7 @@
 # WulfPeak
 
 WulfPeak uses a compact samplesheet and exact, non-recursive FASTQ discovery.
-The v0.2.0 implementation supports paired-end (default) and single-end input
+The v0.2.1 implementation supports paired-end (default) and single-end input
 validation, deterministic command plans, status inspection, conservative
 resume, and real per-sample execution through normalized bigWig coverage.
 
@@ -136,11 +136,22 @@ segments, and declares both the canonical BED3 and support TSV outputs.
 
 ## Execute through coverage
 
-Omitting `--dry-run` executes these phases independently for each sample:
+Omitting `--dry-run` executes all applicable samples in phase-major order, with
+a barrier between phases:
 
 ```text
-fastqc_raw -> trim -> fastqc_trimmed -> align -> bam_process -> coverage
+fastqc_raw:      all samples
+trim:            all samples
+fastqc_trimmed:  all samples
+align:           all samples
+bam_process:     all samples
+coverage:        all samples
 ```
+
+A later phase never starts until the current phase has completed for every
+applicable sample. Execution remains fail-fast: one sample failure stops the
+run, and resume skips reusable completed samples in that phase before
+continuing from failed or incomplete work.
 
 `--stop-after` defaults to `coverage` for a real run. This release accepts
 only that real execution boundary; a later stop such as `peak` fails before
@@ -177,6 +188,9 @@ Status does not require FASTQ, index, or analysis tools:
 wulfpeak status --output-dir WulfPeak_out
 wulfpeak status --output-dir WulfPeak_out --json
 ```
+
+The human-readable status includes the current phase, completed/total counts
+for each planned sample phase, and details for any running or failed sample.
 
 `wulfpeak validate-outputs` validates an existing `output_manifest.json`
 without rerunning analysis. Validation checks gzip FASTQ structure, FastQC

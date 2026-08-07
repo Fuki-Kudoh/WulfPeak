@@ -1,4 +1,4 @@
-"""Preflight, planning, and coverage-bound per-sample execution."""
+"""Preflight, planning, and phase-major execution through coverage."""
 
 from __future__ import annotations
 

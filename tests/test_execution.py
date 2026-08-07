@@ -53,7 +53,11 @@ if counter:
     with open(counter, "a", encoding="utf-8") as handle:
         handle.write(name + "\t" + " ".join(args) + "\n")
 
-fail = os.environ.get("WULFPEAK_FAKE_FAIL") == name
+fail_sample = os.environ.get("WULFPEAK_FAKE_FAIL_SAMPLE")
+fail = (
+    os.environ.get("WULFPEAK_FAKE_FAIL") == name
+    and (not fail_sample or fail_sample in " ".join(args))
+)
 invalid = os.environ.get("WULFPEAK_FAKE_INVALID") == name
 
 def option(flag):
@@ -211,15 +215,28 @@ def prepare_run(root: Path, *, paired: bool) -> tuple[list[str], Path]:
     return execution_args(root, paired=paired), fake_bin
 
 
+def prepare_two_sample_run(root: Path) -> tuple[list[str], Path]:
+    args, fake_bin = prepare_run(root, paired=False)
+    (root / "samples.tsv").write_text(
+        "input_id\tsample_id\tgroup_id\tpeak_type\tcontrol\tqvalue\n"
+        "library_01\tsample_01\tgroup_01\tinput\t.\t.\n"
+        "library_02\tsample_02\tgroup_02\tinput\t.\t.\n",
+        encoding="utf-8",
+    )
+    write_fastq(root / "fastq" / "library_02.fastq.gz")
+    return args, fake_bin
+
+
 def run_with_tools(
     args: list[str], fake_bin: Path, *, counter: Path, fail: str | None = None,
-    invalid: str | None = None,
+    fail_sample: str | None = None, invalid: str | None = None,
 ) -> tuple[int, str]:
     stderr = io.StringIO()
     with environment(
         PATH=f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
         WULFPEAK_FAKE_COUNTER=str(counter),
         WULFPEAK_FAKE_FAIL=fail,
+        WULFPEAK_FAKE_FAIL_SAMPLE=fail_sample,
         WULFPEAK_FAKE_INVALID=invalid,
     ), contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
         code = main(args)
@@ -236,6 +253,16 @@ def tool_counts(counter: Path) -> dict[str, int]:
     return counts
 
 
+def phase_tool_calls(counter: Path, tool: str, phase: str) -> int:
+    if not counter.exists():
+        return 0
+    return sum(
+        1
+        for line in counter.read_text(encoding="utf-8").splitlines()
+        if line.startswith(f"{tool}\t") and f"/{phase}/" in line
+    )
+
+
 def samtools_analysis_calls(counter: Path) -> int:
     if not counter.exists():
         return 0
@@ -249,6 +276,93 @@ def samtools_analysis_calls(counter: Path) -> int:
 
 
 class ExecutionTests(unittest.TestCase):
+    def test_phase_major_fail_fast_resume_continues_with_failed_sample(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args, fake_bin = prepare_two_sample_run(root)
+            counter = root / "calls.log"
+
+            code, error = run_with_tools(
+                args,
+                fake_bin,
+                counter=counter,
+                fail="trim_galore",
+                fail_sample="sample_02",
+            )
+            self.assertEqual(code, 3)
+            self.assertIn("Step trim failed for sample sample_02", error)
+
+            output = root / "out"
+            plan = json.loads(
+                (output / "config" / "command_plan.json").read_text()
+            )
+            expected_phases = (
+                "fastqc_raw",
+                "trim",
+                "fastqc_trimmed",
+                "align",
+                "bam_process",
+                "coverage",
+            )
+            self.assertEqual(
+                [
+                    (step["phase"], step["scope_id"])
+                    for step in plan["steps"]
+                ],
+                [
+                    (phase, sample_id)
+                    for phase in expected_phases
+                    for sample_id in ("sample_01", "sample_02")
+                ],
+            )
+
+            state = json.loads((output / "status" / "state.json").read_text())
+            self.assertEqual(
+                state["steps"]["sample:sample_01:trim"]["status"], "done"
+            )
+            self.assertEqual(
+                state["steps"]["sample:sample_02:trim"]["status"], "failed"
+            )
+            self.assertFalse(
+                any(key.endswith(":fastqc_trimmed") for key in state["steps"])
+            )
+            status_stdout = io.StringIO()
+            with contextlib.redirect_stdout(status_stdout):
+                self.assertEqual(
+                    main(["status", "--output-dir", str(output)]), 0
+                )
+            status_text = status_stdout.getvalue()
+            self.assertIn("phase: trim", status_text)
+            self.assertIn("fastqc_raw:     2/2", status_text)
+            self.assertIn("trim:           1/2", status_text)
+            self.assertIn("fastqc_trimmed: 0/2", status_text)
+            self.assertIn("sample_02  trim", status_text)
+
+            failed_counts = tool_counts(counter)
+            self.assertEqual(failed_counts["fastqc"], 2)
+            self.assertEqual(failed_counts["trim_galore"], 2)
+            failed_raw_fastqc = phase_tool_calls(
+                counter, "fastqc", "fastqc_raw"
+            )
+            code, error = run_with_tools(args, fake_bin, counter=counter)
+            self.assertEqual(code, 0, error)
+            resumed_counts = tool_counts(counter)
+            self.assertEqual(
+                phase_tool_calls(counter, "fastqc", "fastqc_raw"),
+                failed_raw_fastqc,
+            )
+            self.assertEqual(
+                resumed_counts["trim_galore"], failed_counts["trim_galore"] + 1
+            )
+            final_state = json.loads(
+                (output / "status" / "state.json").read_text()
+            )
+            self.assertEqual(len(final_state["steps"]), 12)
+            self.assertEqual(
+                {step["status"] for step in final_state["steps"].values()},
+                {"done"},
+            )
+
     def test_single_end_executes_through_coverage(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

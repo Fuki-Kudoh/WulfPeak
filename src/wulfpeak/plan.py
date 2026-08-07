@@ -76,6 +76,12 @@ def _record(
     return record
 
 
+def _phase_major(steps: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Keep input order within each phase while placing phase barriers in the plan."""
+
+    return sorted(steps, key=lambda step: PHASES.index(str(step["phase"])))
+
+
 def _peak_plan(
     *,
     config: RunConfig,
@@ -698,7 +704,7 @@ def build_command_plan(
                 "promotion": "os.replace each validated file without replacing its parent directory",
                 "failure": "never promote partial or invalid output",
             },
-            "steps": steps,
+            "steps": _phase_major(steps),
         }
 
     report_tmp = _step_tmp(output, "pipeline", "run", "report")
@@ -770,5 +776,5 @@ def build_command_plan(
             "promotion": "os.replace each validated file without replacing its parent directory",
             "failure": "never promote partial or invalid output",
         },
-        "steps": steps,
+        "steps": _phase_major(steps),
     }
