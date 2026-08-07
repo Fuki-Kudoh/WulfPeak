@@ -71,7 +71,7 @@ def _build_parser() -> argparse.ArgumentParser:
     check.set_defaults(func=_run_check)
 
     run = subparsers.add_parser(
-        "run", help="preflight and execute per-sample steps through coverage"
+        "run", help="preflight and execute through pipeline-scoped MultiQC"
     )
     _add_common_inputs(run)
     run.add_argument("--assay", required=True, choices=[item.value for item in Assay])
@@ -149,7 +149,7 @@ def _run_check(args: argparse.Namespace) -> int:
 
 
 def _run_pipeline(args: argparse.Namespace) -> int:
-    resolved_stop_after = args.stop_after or (None if args.dry_run else "coverage")
+    resolved_stop_after = args.stop_after or (None if args.dry_run else "multiqc")
     config = RunConfig(
         samplesheet=Path(args.samplesheet).expanduser().resolve(),
         fastq_dir=Path(args.fastq_dir).expanduser().resolve(),
@@ -179,7 +179,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
     if config.dry_run:
         print("WulfPeak dry-run preflight passed; no analysis commands were executed")
     else:
-        print("WulfPeak execution completed through coverage")
+        print(f"WulfPeak execution completed through {config.stop_after}")
     print(f"Manifest: {manifest}\nCommand plan: {plan}\nRun metadata: {metadata}")
     return 0
 
@@ -222,7 +222,7 @@ def _run_status(args: argparse.Namespace) -> int:
                 if heading == "running":
                     suffix = f"  {_elapsed(detail.get('started_at'))}"
                 print(
-                    f"  {detail.get('sample_id', '?')}  "
+                    f"  {detail.get('sample_id', detail.get('scope', '?'))}  "
                     f"{detail.get('phase', '?')}{suffix}"
                 )
     return 0

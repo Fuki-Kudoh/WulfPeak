@@ -144,13 +144,13 @@ def run_preflight(config: RunConfig) -> PreflightResult:
         "bowtie2": "align",
         "samtools": "align",
         "bamCoverage": "coverage",
+        "multiqc": "multiqc",
         "macs3": "peak",
         "bedtools": "consensus_peak",
-        "multiqc": "report",
     }
     # Dry-run remains full-preflight even when its displayed plan is truncated.
-    # Real coverage execution intentionally needs only the implemented tools.
-    selected_stop = PHASES[-1] if config.dry_run else (config.stop_after or "coverage")
+    # Real execution requires tools only through its selected boundary.
+    selected_stop = PHASES[-1] if config.dry_run else (config.stop_after or "multiqc")
     stop_index = PHASES.index(selected_stop)
     required_tools = tuple(
         name

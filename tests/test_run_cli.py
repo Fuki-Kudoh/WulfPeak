@@ -257,6 +257,37 @@ class RunCliTests(unittest.TestCase):
             with environment("PATH", f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}"):
                 self.assertEqual(main(run_args(root, single_end=False)), 0)
             plan = json.loads((root / "out" / "config" / "command_plan.json").read_text())
+            multiqc_steps = [
+                step for step in plan["steps"] if step["phase"] == "multiqc"
+            ]
+            self.assertEqual(len(multiqc_steps), 1)
+            multiqc_step = multiqc_steps[0]
+            self.assertEqual(
+                (multiqc_step["scope"], multiqc_step["scope_id"]),
+                ("pipeline", "run"),
+            )
+            self.assertEqual(
+                multiqc_step["artifacts"][0]["promotion"],
+                "validate_then_staged_directory_replace",
+            )
+            phase_names = [step["phase"] for step in plan["steps"]]
+            multiqc_index = phase_names.index("multiqc")
+            self.assertTrue(
+                all(
+                    index < multiqc_index
+                    for index, phase in enumerate(phase_names)
+                    if phase == "coverage"
+                )
+            )
+            self.assertEqual(phase_names[multiqc_index + 1], "peak")
+            report = next(step for step in plan["steps"] if step["phase"] == "report")
+            self.assertFalse(
+                any(
+                    action["type"] == "command"
+                    and Path(action["argv"][0]).name == "multiqc"
+                    for action in report["actions"]
+                )
+            )
             align = next(step for step in plan["steps"] if step["phase"] == "align")
             align_argv = command_argvs(align)[0]
             self.assertIn("-1", align_argv)
@@ -374,7 +405,7 @@ class RunCliTests(unittest.TestCase):
             self.assertIsNotNone(intersect["stdout_path"])
             self.assertEqual(intersect["stdout_write"], "atomic_replace")
 
-    def test_non_dry_run_rejects_stop_after_beyond_coverage(self) -> None:
+    def test_non_dry_run_rejects_stop_after_beyond_multiqc(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             args = run_args(root, single_end=True)

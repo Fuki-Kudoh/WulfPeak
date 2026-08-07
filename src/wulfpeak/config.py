@@ -15,6 +15,7 @@ PHASES = (
     "align",
     "bam_process",
     "coverage",
+    "multiqc",
     "peak",
     "pool_bam",
     "pooled_peak",
@@ -22,7 +23,7 @@ PHASES = (
     "report",
 )
 
-IMPLEMENTED_PHASES = PHASES[: PHASES.index("coverage") + 1]
+IMPLEMENTED_PHASES = PHASES[: PHASES.index("multiqc") + 1]
 
 
 class ConfigurationError(ValueError):
@@ -80,16 +81,17 @@ class RunConfig:
         if (
             not self.dry_run
             and self.stop_after is not None
-            and self.stop_after != "coverage"
+            and self.stop_after not in {"coverage", "multiqc"}
         ):
             if self.stop_after in IMPLEMENTED_PHASES:
                 errors.append(
-                    "non-dry-run execution in this release must stop after coverage"
+                    "non-dry-run execution in this release must stop after "
+                    "coverage or multiqc"
                 )
             else:
                 errors.append(
                     f"--stop-after {self.stop_after} is beyond the implemented "
-                    "execution boundary (coverage)"
+                    "execution boundary (multiqc)"
                 )
         if (
             not self.dry_run
@@ -98,7 +100,7 @@ class RunConfig:
         ):
             errors.append(
                 f"--force-from {self.force_from} is beyond the implemented "
-                "execution boundary (coverage)"
+                "execution boundary (multiqc)"
             )
         if errors:
             raise ConfigurationError("Run configuration failed:\n" + "\n".join(

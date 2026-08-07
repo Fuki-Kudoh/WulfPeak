@@ -13,7 +13,11 @@ from wulfpeak.preflight import (
     validate_blacklist,
     validate_bowtie2_index,
 )
-from wulfpeak.plan_schema import artifact_contract, promote_file_artifact
+from wulfpeak.plan_schema import (
+    artifact_contract,
+    promote_directory_artifact,
+    promote_file_artifact,
+)
 from wulfpeak.signatures import canonical_signature
 from wulfpeak.status import (
     LockConflictError,
@@ -24,7 +28,7 @@ from wulfpeak.status import (
     write_pipeline_status,
     write_step_state,
 )
-from wulfpeak.validators import validate_output_manifest
+from wulfpeak.validators import validate_output_manifest, validate_path
 
 
 INDEX_SUFFIXES = (".1", ".2", ".3", ".4", ".rev.1", ".rev.2")
@@ -227,13 +231,82 @@ class FoundationTests(unittest.TestCase):
                         )
                     self.assertEqual(list(temporary_dir.iterdir()), [])
 
-    def test_directory_artifacts_are_rejected(self) -> None:
-        with self.assertRaisesRegex(ValueError, "directory artifacts"):
-            artifact_contract(
+    def test_directory_artifacts_use_same_parent_staged_promotion(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "step" / "multiqc"
+            canonical = root / "output" / "multiqc"
+            source.mkdir(parents=True)
+            canonical.mkdir(parents=True)
+            (source / "multiqc_report.html").write_text("new\n")
+            (source / "multiqc_data").mkdir()
+            (source / "multiqc_data" / "data.json").write_text("{}\n")
+            (canonical / "old.txt").write_text("old\n")
+            artifact = artifact_contract(
                 "directory",
-                "/tmp/temporary",
-                "/tmp/canonical",
-                validator="directory",
+                source,
+                canonical,
+                validator="multiqc_output",
+            )
+            self.assertEqual(
+                artifact["promotion"], "validate_then_staged_directory_replace"
+            )
+            promote_directory_artifact(artifact, validated=True)
+            self.assertFalse((canonical / "old.txt").exists())
+            self.assertEqual(
+                (canonical / "multiqc_data" / "data.json").read_text(), "{}\n"
+            )
+            self.assertFalse(source.exists())
+
+    def test_multiqc_validator_requires_nonempty_sources_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "multiqc"
+            data = output / "multiqc_data"
+            data.mkdir(parents=True)
+            (output / "multiqc_report.html").write_text("<html>report</html>\n")
+
+            self.assertFalse(
+                validate_path(
+                    output, "directory", validator="multiqc_output"
+                ).valid
+            )
+            sources = data / "multiqc_sources.txt"
+            sources.write_text("\n")
+            self.assertFalse(
+                validate_path(
+                    output, "directory", validator="multiqc_output"
+                ).valid
+            )
+            sources.write_text("module\tsource\nfastqc\treads.zip\n")
+            self.assertTrue(
+                validate_path(
+                    output, "directory", validator="multiqc_output"
+                ).valid
+            )
+
+    def test_trim_galore_report_validator_accepts_v1_and_validates_v2_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            reports = Path(temporary)
+            (reports / "trimming_report.txt").write_text("combined\n")
+            (reports / "reads.fastq.gz_trimming_report.txt").write_text("v1\n")
+            self.assertTrue(
+                validate_path(
+                    reports, "directory", validator="trim_galore_reports"
+                ).valid
+            )
+
+            json_report = reports / "reads.fastq.gz_trimming_report.json"
+            json_report.write_text("not json\n")
+            self.assertFalse(
+                validate_path(
+                    reports, "directory", validator="trim_galore_reports"
+                ).valid
+            )
+            json_report.write_text('{"trim_galore_version": "2.0"}\n')
+            self.assertTrue(
+                validate_path(
+                    reports, "directory", validator="trim_galore_reports"
+                ).valid
             )
 
     def test_resume_requires_done_signature_outputs_and_upstream(self) -> None:
@@ -314,6 +387,73 @@ class FoundationTests(unittest.TestCase):
                     {
                         "sample_id": "s2",
                         "phase": "trim",
+                        "started_at": "2026-08-07T00:00:00+00:00",
+                    }
+                ],
+            )
+
+    def test_status_represents_running_multiqc_as_pipeline_scoped(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            (output / "config").mkdir()
+            (output / "config" / "command_plan.json").write_text(
+                json.dumps(
+                    {
+                        "steps": [
+                            {
+                                "scope": "sample",
+                                "scope_id": sample,
+                                "phase": "coverage",
+                            }
+                            for sample in ("s1", "s2")
+                        ]
+                        + [
+                            {
+                                "scope": "pipeline",
+                                "scope_id": "run",
+                                "phase": "multiqc",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            write_pipeline_status(output, "running")
+            for sample in ("s1", "s2"):
+                write_step_state(
+                    output,
+                    StepState("coverage", "done", signature=f"{sample}-coverage"),
+                    scope="samples",
+                    scope_id=sample,
+                )
+            write_step_state(
+                output,
+                StepState(
+                    "multiqc",
+                    "running",
+                    signature="multiqc",
+                    started_at="2026-08-07T00:00:00+00:00",
+                ),
+                scope="pipeline",
+                scope_id="run",
+            )
+
+            payload = read_status(output)
+            self.assertEqual(payload["phase"], "multiqc")
+            self.assertEqual(
+                payload["phase_counts"],
+                {
+                    "coverage": {"completed": 2, "total": 2},
+                    "multiqc": {"completed": 0, "total": 1},
+                },
+            )
+            self.assertEqual(
+                payload["running"],
+                [
+                    {
+                        "scope": "pipeline",
+                        "scope_id": "run",
+                        "phase": "multiqc",
                         "started_at": "2026-08-07T00:00:00+00:00",
                     }
                 ],

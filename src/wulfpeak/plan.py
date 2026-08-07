@@ -264,13 +264,13 @@ def build_command_plan(
                     validator="gzip_fastq",
                 )
             )
-        trimming_report = output / "qc" / "trimming" / sample_id / "trimming_report.txt"
+        trimming_qc_tmp = trim_tmp / "canonical" / "trimming_qc"
         trim_artifacts.append(
             artifact_contract(
-                "text",
-                trim_tmp / "canonical" / "trimming_report.txt",
-                trimming_report,
-                validator="text_nonempty",
+                "directory",
+                trimming_qc_tmp,
+                output / "qc" / "trimming" / sample_id,
+                validator="trim_galore_reports",
             )
         )
         steps.append(
@@ -285,8 +285,11 @@ def build_command_plan(
                         output_dir=str(trim_tmp),
                         read_layout=config.read_layout.value,
                         canonical_temporary_paths=[
-                            artifact["temporary_path"] for artifact in trim_artifacts
+                            artifact["temporary_path"]
+                            for artifact in trim_artifacts
+                            if artifact["kind"] == "fastq"
                         ],
+                        report_temporary_directory=str(trimming_qc_tmp),
                         write_mode="atomic_replace",
                     ),
                 ],
@@ -564,6 +567,34 @@ def build_command_plan(
                 _record("peak", "sample", sample_id, actions, artifacts)
             )
 
+    if includes("multiqc"):
+        multiqc_tmp = _step_tmp(output, "pipeline", "run", "multiqc") / "output"
+        steps.append(
+            _record(
+                "multiqc",
+                "pipeline",
+                "run",
+                [
+                    command_action(
+                        [
+                            _tool(tools, "multiqc"),
+                            str(output / "qc"),
+                            "--outdir",
+                            str(multiqc_tmp),
+                        ]
+                    )
+                ],
+                [
+                    artifact_contract(
+                        "directory",
+                        multiqc_tmp,
+                        output / "multiqc",
+                        validator="multiqc_output",
+                    )
+                ],
+            )
+        )
+
     for group in groups if includes("pool_bam") else ():
         pool_tmp = _step_tmp(output, "groups", group.group_id, "pool_bam")
         pooled_bam_tmp = pool_tmp / f"{group.group_id}.pooled.bam"
@@ -693,28 +724,22 @@ def build_command_plan(
             "artifact_contract": {
                 "command_outputs": "write temporary_path only",
                 "validation": "run the declared validator on temporary_path",
-                "promotion": "os.replace each validated file without replacing its parent directory",
+                "promotion": (
+                    "validated files use atomic replacement; validated directories "
+                    "use a same-parent staged replacement"
+                ),
                 "failure": "never promote partial or invalid output",
             },
             "steps": _phase_major(steps),
         }
 
     report_tmp = _step_tmp(output, "pipeline", "run", "report")
-    multiqc_tmp = report_tmp / "multiqc"
     report_files = {
         "run_summary.tsv": "summary_tsv",
         "run_summary.json": "summary_json",
         "warnings.tsv": "warnings_tsv",
     }
     report_actions = [
-        command_action(
-            [
-                _tool(tools, "multiqc"),
-                str(output),
-                "--outdir",
-                str(multiqc_tmp),
-            ]
-        ),
         internal_action(
             "build_run_summary",
             temporary_output_dir=str(report_tmp),
@@ -723,14 +748,7 @@ def build_command_plan(
             write_mode="atomic_replace",
         ),
     ]
-    report_artifacts = [
-        artifact_contract(
-            "html",
-            multiqc_tmp / "multiqc_report.html",
-            output / "multiqc" / "multiqc_report.html",
-            validator="html_nonempty",
-        )
-    ]
+    report_artifacts = []
     for filename, validator in report_files.items():
         report_artifacts.append(
             artifact_contract(
@@ -766,7 +784,10 @@ def build_command_plan(
         "artifact_contract": {
             "command_outputs": "write temporary_path only",
             "validation": "run the declared validator on temporary_path",
-            "promotion": "os.replace each validated file without replacing its parent directory",
+            "promotion": (
+                "validated files use atomic replacement; validated directories "
+                "use a same-parent staged replacement"
+            ),
             "failure": "never promote partial or invalid output",
         },
         "steps": _phase_major(steps),
