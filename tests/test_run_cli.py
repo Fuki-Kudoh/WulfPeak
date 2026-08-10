@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 
 from wulfpeak.cli import main
+from wulfpeak.sort_scratch import sort_run_namespace
 from wulfpeak.tools import REQUIRED_TOOLS
 
 
@@ -115,8 +116,79 @@ class RunCliTests(unittest.TestCase):
                 (root / "out" / "config" / "command_plan.json").read_text()
             )
             self.assertEqual(manifest["parameters"]["jobs"], 1)
+            self.assertIsNone(manifest["parameters"]["sort_temp_dir"])
             self.assertEqual(metadata["options"]["jobs"], 1)
+            self.assertIsNone(metadata["options"]["sort_temp_dir"])
             self.assertEqual(plan["jobs"], 1)
+
+    def test_sort_temp_dir_normalizes_and_is_recorded_in_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_bin = self.prepare(root)
+            (root / "samples.tsv").write_text(
+                "input_id\tsample_id\tgroup_id\tpeak_type\tcontrol\tqvalue\n"
+                "library_01\tsample_01\tgroup_01\tinput\t.\t.\n",
+                encoding="utf-8",
+            )
+            (root / "fastq" / "library_01.fastq.gz").write_bytes(b"synthetic")
+            home = root / "home"
+            home.mkdir()
+            absolute = root / "absolute-scratch"
+            cases = (
+                (None, None),
+                ("relative-scratch", root / "relative-scratch"),
+                ("~/tilde-scratch", home / "tilde-scratch"),
+                (str(absolute), absolute),
+            )
+            selected_path = f"{fake_bin}{os.pathsep}{os.environ['PATH']}"
+            with contextlib.chdir(root), environment("HOME", str(home)), environment(
+                "PATH", selected_path
+            ):
+                for supplied, expected in cases:
+                    with self.subTest(supplied=supplied):
+                        args = run_args(root, single_end=True)
+                        if supplied is not None:
+                            args.extend(["--sort-temp-dir", supplied])
+                        self.assertEqual(main(args), 0)
+                        manifest = json.loads(
+                            (root / "out" / "config" / "manifest.json").read_text()
+                        )
+                        metadata = json.loads(
+                            (root / "out" / "metadata" / "run_metadata.json").read_text()
+                        )
+                        normalized = str(expected.resolve()) if expected else None
+                        self.assertEqual(
+                            manifest["parameters"]["sort_temp_dir"], normalized
+                        )
+                        self.assertEqual(
+                            metadata["options"]["sort_temp_dir"], normalized
+                        )
+
+    def test_invalid_sort_temp_dir_fails_during_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_bin = self.prepare(root)
+            (root / "samples.tsv").write_text(
+                "input_id\tsample_id\tgroup_id\tpeak_type\tcontrol\tqvalue\n"
+                "library_01\tsample_01\tgroup_01\tinput\t.\t.\n",
+                encoding="utf-8",
+            )
+            (root / "fastq" / "library_01.fastq.gz").write_bytes(b"synthetic")
+            invalid = root / "not-a-directory"
+            invalid.write_text("file\n", encoding="utf-8")
+            stderr = io.StringIO()
+            with environment(
+                "PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}"
+            ), contextlib.redirect_stderr(stderr):
+                code = main(
+                    [
+                        *run_args(root, single_end=True),
+                        "--sort-temp-dir",
+                        str(invalid),
+                    ]
+                )
+            self.assertEqual(code, 2)
+            self.assertIn("samtools sort scratch is not writable", stderr.getvalue())
 
     def test_positive_jobs_is_accepted_and_nonpositive_values_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -281,11 +353,66 @@ class RunCliTests(unittest.TestCase):
                 self.assertEqual(
                     option_value(by_subcommand["sort"], "-@"), str(sort_workers)
                 )
+                self.assertNotIn("-T", by_subcommand["sort"])
                 for subcommand in ("index", "flagstat", "stats"):
                     self.assertEqual(
                         option_value(by_subcommand[subcommand], "-@"),
                         str(samtools_workers),
                     )
+
+    def test_sort_temp_plan_prefixes_are_stable_sample_and_run_specific(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_bin = self.prepare(root)
+            (root / "samples.tsv").write_text(
+                "input_id\tsample_id\tgroup_id\tpeak_type\tcontrol\tqvalue\n"
+                "library_01\tsample_01\tgroup_01\tinput\t.\t.\n"
+                "library_02\tsample_02\tgroup_02\tinput\t.\t.\n",
+                encoding="utf-8",
+            )
+            for library in ("library_01", "library_02"):
+                (root / "fastq" / f"{library}.fastq.gz").write_bytes(b"synthetic")
+            scratch = root / "scratch"
+            args = [
+                *run_args(root, single_end=True),
+                "--jobs",
+                "2",
+                "--sort-temp-dir",
+                str(scratch),
+            ]
+            selected_path = f"{fake_bin}{os.pathsep}{os.environ['PATH']}"
+
+            def planned_prefixes() -> dict[str, Path]:
+                plan = json.loads(
+                    (root / "out" / "config" / "command_plan.json").read_text()
+                )
+                prefixes: dict[str, Path] = {}
+                for step in plan["steps"]:
+                    if step["phase"] != "bam_process":
+                        continue
+                    sort = next(
+                        argv
+                        for argv in command_argvs(step)
+                        if len(argv) > 1 and argv[1] == "sort"
+                    )
+                    self.assertEqual(sort.count("-T"), 1)
+                    prefixes[step["scope_id"]] = Path(option_value(sort, "-T"))
+                return prefixes
+
+            with environment("PATH", selected_path):
+                self.assertEqual(main(args), 0)
+                first = planned_prefixes()
+                self.assertEqual(main(args), 0)
+                second = planned_prefixes()
+            self.assertEqual(first, second)
+            self.assertEqual(set(first), {"sample_01", "sample_02"})
+            self.assertEqual(len(set(first.values())), 2)
+            namespace = sort_run_namespace(scratch, root / "out")
+            for sample_id, prefix in first.items():
+                self.assertEqual(prefix, namespace / sample_id / "sort")
+            self.assertNotEqual(
+                namespace, sort_run_namespace(scratch, root / "different-out")
+            )
 
     def test_paired_end_dry_run_plans_control_and_replicates(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

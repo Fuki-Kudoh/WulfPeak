@@ -112,6 +112,7 @@ wulfpeak run \
   --effective-genome-size 1000000 \
   --threads 6 \
   --jobs 2 \
+  --sort-temp-dir /scratch/wulfpeak-sort \
   --dry-run
 ```
 
@@ -179,6 +180,14 @@ uses no additional samtools workers, although a streaming pipeline still
 requires its two main processes. The resolved allocation is recorded in
 `command_plan.json` as `thread_allocation`.
 
+`--sort-temp-dir PATH` optionally places only `samtools sort` spill files in a
+deterministic, per-output-directory and per-sample namespace beneath `PATH`.
+The path is write-tested during preflight and appears as `samtools sort -T` in
+the command plan. Coordinate BAMs and every canonical artifact remain beneath
+`--output-dir`. Scratch placement is operational provenance and is excluded
+from reusable BAM-step signatures, so changing or omitting this option does
+not invalidate an otherwise reusable completed `bam_process` step.
+
 `--stop-after` defaults to `multiqc` for a real run. Use `--stop-after coverage`
 to stop before consolidated reporting, or `--stop-after multiqc` explicitly for
 the default v0.2.1 boundary. A later stop such as `peak` fails before preflight.
@@ -210,7 +219,9 @@ checkpoint and coordinate-sort scratch as soon as that sample completes
 scratch. Resume reuses the downstream validated final BAM or regenerates the
 alignment checkpoint when BAM processing must rerun. Pass `--keep-intermediates`
 to retain the collated checkpoint and coordinate-sort scratch; the checkpoint
-is then included in `output_manifest.json`.
+is then included in `output_manifest.json`. External `samtools sort` spill
+files configured by `--sort-temp-dir` are always ephemeral and are never
+retained by `--keep-intermediates` or listed in `output_manifest.json`.
 
 Normalized BigWig generation remains the responsibility of `coverage`; v0.2.1
 does not change that processing. It adds consolidated QC reporting from the
