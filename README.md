@@ -1,7 +1,7 @@
 # WulfPeak
 
 WulfPeak uses a compact samplesheet and exact, non-recursive FASTQ discovery.
-The v0.2.1 implementation supports paired-end (default) and single-end input
+The v0.2.2 implementation supports paired-end (default) and single-end input
 validation, deterministic command plans, status inspection, conservative
 resume, real per-sample execution through normalized BigWig coverage, and a
 pipeline-scoped MultiQC report after all samples complete coverage.
@@ -190,7 +190,7 @@ not invalidate an otherwise reusable completed `bam_process` step.
 
 `--stop-after` defaults to `multiqc` for a real run. Use `--stop-after coverage`
 to stop before consolidated reporting, or `--stop-after multiqc` explicitly for
-the default v0.2.1 boundary. A later stop such as `peak` fails before preflight.
+the default v0.2.2 boundary. A later stop such as `peak` fails before preflight.
 MACS3 peak calling, pooled BAMs, pooled and consensus peaks, and the final
 WulfPeak `report` phase remain plan-only and are never executed by this release.
 The final `report` phase is distinct from MultiQC and remains reserved for a
