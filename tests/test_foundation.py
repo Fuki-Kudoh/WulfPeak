@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -20,6 +21,7 @@ from wulfpeak.plan_schema import (
     promote_file_artifact,
 )
 from wulfpeak.signatures import canonical_signature
+from wulfpeak.sort_scratch import validate_sort_scratch
 from wulfpeak.status import (
     LockConflictError,
     RunLock,
@@ -36,6 +38,25 @@ INDEX_SUFFIXES = (".1", ".2", ".3", ".4", ".rev.1", ".rev.2")
 
 
 class FoundationTests(unittest.TestCase):
+    def test_sort_scratch_write_probe_accepts_writable_and_rejects_unwritable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            writable = root / "writable"
+            namespace = validate_sort_scratch(writable, root / "output")
+            self.assertTrue(namespace.is_dir())
+            self.assertEqual(list(namespace.iterdir()), [])
+
+            unwritable = root / "unwritable"
+            unwritable.mkdir()
+            unwritable.chmod(0o500)
+            try:
+                if os.access(unwritable, os.W_OK):
+                    self.skipTest("filesystem does not enforce owner write bits")
+                with self.assertRaisesRegex(OSError, "scratch is not writable"):
+                    validate_sort_scratch(unwritable, root / "other-output")
+            finally:
+                unwritable.chmod(0o700)
+
     def test_concurrent_shared_state_updates_do_not_lose_sample_results(self) -> None:
         # Repeat simultaneous writes so an unlocked read-modify-write
         # implementation reliably loses one of the two entries.

@@ -6,6 +6,7 @@ import json
 import platform
 import shutil
 import socket
+from copy import deepcopy
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -20,6 +21,12 @@ from .manifest import ResolvedSample, write_run_manifest
 from .plan import build_command_plan
 from .preflight import PreflightResult, run_preflight
 from .signatures import canonical_signature, large_file_fingerprint
+from .sort_scratch import (
+    cleanup_sample_sort_scratch,
+    prepare_sample_sort_scratch,
+    sort_sample_directory,
+    sort_temp_prefix,
+)
 from .status import (
     RunLock,
     StepState,
@@ -38,6 +45,7 @@ class _SampleWork:
     signature: str
     log_path: Path
     output_ids: tuple[str, ...]
+    sort_scratch_directory: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -65,6 +73,8 @@ def _execute_sample_step(
         output_dir, running, scope="samples", scope_id=work.sample_id
     )
     try:
+        if work.sort_scratch_directory is not None:
+            prepare_sample_sort_scratch(work.sort_scratch_directory)
         executor.execute(work.step, work.log_path)
     except BaseException as exc:
         failed = StepState(
@@ -87,6 +97,9 @@ def _execute_sample_step(
             output_dir, failed, scope="samples", scope_id=work.sample_id
         )
         return _StepOutcome(work, failed, exc)
+    finally:
+        if work.sort_scratch_directory is not None:
+            cleanup_sample_sort_scratch(work.sort_scratch_directory)
     done = StepState(
         work.phase,
         "done",
@@ -275,7 +288,7 @@ def _step_signature(
     return canonical_signature(
         {
             "signature_schema": 2,
-            "step": step,
+            "step": _signature_step(step, config),
             "inputs": fingerprints,
             "upstream_signature": upstream_signature,
             # MultiQC is downstream of every sample step. Excluding it here
@@ -288,6 +301,45 @@ def _step_signature(
             },
         }
     )
+
+
+def _signature_step(
+    step: dict[str, object], config: RunConfig
+) -> dict[str, object]:
+    """Exclude only WulfPeak's generated samtools sort scratch prefix."""
+
+    if step.get("phase") != "bam_process" or config.sort_temp_dir is None:
+        return step
+    sample_id = str(step.get("scope_id"))
+    expected_prefix = str(
+        sort_temp_prefix(config.sort_temp_dir, config.output_dir, sample_id)
+    )
+    normalized = deepcopy(step)
+    actions = normalized.get("actions")
+    if not isinstance(actions, list):
+        return step
+    for action in actions:
+        if not isinstance(action, dict) or action.get("type") != "pipeline":
+            continue
+        commands = action.get("commands")
+        if not isinstance(commands, list):
+            continue
+        for command in commands:
+            if not isinstance(command, dict):
+                continue
+            argv = command.get("argv")
+            if (
+                not isinstance(argv, list)
+                or len(argv) < 4
+                or Path(str(argv[0])).name != "samtools"
+                or argv[1] != "sort"
+            ):
+                continue
+            for index in range(2, len(argv) - 1):
+                if argv[index : index + 2] == ["-T", expected_prefix]:
+                    del argv[index : index + 2]
+                    return normalized
+    return step
 
 
 def _pipeline_step_signature(
@@ -635,12 +687,18 @@ def prepare_run(config: RunConfig, argv: list[str]) -> tuple[Path, Path, Path]:
                     continue
                 chain_unchanged[sample_id] = False
                 reset_step_temporary(config.output_dir, step)
+                sort_scratch_directory = None
+                if phase == "bam_process" and config.sort_temp_dir is not None:
+                    sort_scratch_directory = sort_sample_directory(
+                        config.sort_temp_dir, config.output_dir, sample_id
+                    )
                 return _SampleWork(
                     step=step, sample_id=sample_id, phase=phase,
                     signature=signature,
                     log_path=(config.output_dir / "logs" / "samples" / sample_id
                               / f"{phase}.log"),
                     output_ids=_artifact_ids(step),
+                    sort_scratch_directory=sort_scratch_directory,
                 ), position
             return None, position
 

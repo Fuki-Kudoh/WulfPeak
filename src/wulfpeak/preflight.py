@@ -12,6 +12,7 @@ from .manifest import ResolvedSample, build_groups, resolve_sample
 from .models import ReplicateGroup, ToolInfo
 from .paths import create_output_directories
 from .samplesheet import SamplesheetValidationError, load_samplesheet
+from .sort_scratch import validate_sort_scratch
 from .tools import REQUIRED_TOOLS, ToolDetectionError, detect_tools
 
 
@@ -126,6 +127,11 @@ def run_preflight(config: RunConfig) -> PreflightResult:
     create_output_directories(config.output_dir)
     if not os.access(config.output_dir, os.W_OK):
         raise PreflightError(f"Output directory is not writable: {config.output_dir}")
+    if config.sort_temp_dir is not None:
+        try:
+            validate_sort_scratch(config.sort_temp_dir, config.output_dir)
+        except OSError as exc:
+            raise PreflightError(str(exc)) from exc
     index_files = validate_bowtie2_index(config.bowtie2_index)
     if config.blacklist is not None:
         validate_blacklist(config.blacklist)

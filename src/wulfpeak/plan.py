@@ -15,6 +15,7 @@ from .plan_schema import (
     pipeline_action,
 )
 from .resources import allocate_threads
+from .sort_scratch import sort_temp_prefix
 
 
 def _tool(tools: dict[str, ToolInfo], name: str) -> str:
@@ -413,6 +414,30 @@ def build_command_plan(
             "stats": bam_tmp / f"{sample_id}.stats.txt",
             "idxstats": bam_tmp / f"{sample_id}.idxstats.txt",
         }
+        sort_command = [
+            _tool(tools, "samtools"),
+            "sort",
+        ]
+        if config.sort_temp_dir is not None:
+            sort_command.extend(
+                [
+                    "-T",
+                    str(
+                        sort_temp_prefix(
+                            config.sort_temp_dir, config.output_dir, sample_id
+                        )
+                    ),
+                ]
+            )
+        sort_command.extend(
+            [
+                "-@",
+                str(thread_allocation.sort_workers),
+                "-o",
+                str(coordinate_bam),
+                "-",
+            ]
+        )
         bam_actions = [
             pipeline_action(
                 [
@@ -423,15 +448,7 @@ def build_command_plan(
                         str(canonical_collated),
                         "-",
                     ],
-                    [
-                        _tool(tools, "samtools"),
-                        "sort",
-                        "-@",
-                        str(thread_allocation.sort_workers),
-                        "-o",
-                        str(coordinate_bam),
-                        "-",
-                    ],
+                    sort_command,
                 ]
             ),
             pipeline_action([markdup, filter_command]),

@@ -85,6 +85,10 @@ def _build_parser() -> argparse.ArgumentParser:
         default=1,
         help="maximum concurrently running sample-scoped steps (default: 1)",
     )
+    run.add_argument(
+        "--sort-temp-dir",
+        help="place only samtools sort temporary spill files under PATH",
+    )
     run.add_argument("--min-mapq", type=_nonnegative_int, default=30)
     run.add_argument("--duplicate-policy", choices=("remove", "keep"), default="remove")
     run.add_argument("--allow-dovetail", action="store_true")
@@ -166,6 +170,11 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         effective_genome_size=args.effective_genome_size,
         threads=args.threads,
         jobs=args.jobs,
+        sort_temp_dir=(
+            Path(args.sort_temp_dir).expanduser().resolve()
+            if args.sort_temp_dir
+            else None
+        ),
         read_layout=_layout(args),
         min_mapq=args.min_mapq,
         duplicate_policy=args.duplicate_policy,

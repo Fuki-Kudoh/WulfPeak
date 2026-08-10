@@ -41,6 +41,7 @@ class RunConfig:
     effective_genome_size: int
     threads: int
     jobs: int = 1
+    sort_temp_dir: Path | None = None
     read_layout: ReadLayout = ReadLayout.PAIRED_END
     min_mapq: int = 30
     duplicate_policy: str = "remove"
@@ -56,6 +57,12 @@ class RunConfig:
     stop_after: str | None = None
 
     def __post_init__(self) -> None:
+        if self.sort_temp_dir is not None:
+            object.__setattr__(
+                self,
+                "sort_temp_dir",
+                Path(self.sort_temp_dir).expanduser().resolve(),
+            )
         errors: list[str] = []
         if not self.genome_id.strip():
             errors.append("--genome-id must be non-empty")
@@ -117,6 +124,9 @@ class RunConfig:
         payload["output_dir"] = str(self.output_dir)
         payload["bowtie2_index"] = str(self.bowtie2_index)
         payload["blacklist"] = str(self.blacklist) if self.blacklist else None
+        payload["sort_temp_dir"] = (
+            str(self.sort_temp_dir) if self.sort_temp_dir else None
+        )
         payload["assay"] = self.assay.value
         payload["read_layout"] = self.read_layout.value
         return payload

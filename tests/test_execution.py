@@ -157,6 +157,12 @@ if name == "samtools":
             raise SystemExit(1)
         print("chrSynthetic\t1000\t1\t0")
         raise SystemExit(0)
+    if subcommand == "sort" and "-T" in args:
+        prefix = Path(option("-T"))
+        prefix.parent.mkdir(parents=True, exist_ok=True)
+        Path(str(prefix) + ".synthetic-spill.tmp").write_text(
+            "synthetic spill\n", encoding="utf-8"
+        )
     if fail:
         raise SystemExit(10)
     if subcommand == "view":
@@ -372,6 +378,17 @@ def samtools_analysis_calls(counter: Path) -> int:
     )
 
 
+def samtools_subcommand_calls(counter: Path, selected: set[str]) -> list[str]:
+    if not counter.exists():
+        return []
+    return [
+        line
+        for line in counter.read_text(encoding="utf-8").splitlines()
+        if line.startswith("samtools\t")
+        and line.split("\t", 1)[1].split(" ", 1)[0] in selected
+    ]
+
+
 def wait_for_paths(paths: set[Path], *, timeout: float = 15) -> None:
     deadline = time.monotonic() + timeout
     while not all(path.exists() for path in paths):
@@ -391,6 +408,156 @@ def shared_step_status(output: Path, sample_id: str, phase: str) -> str | None:
 
 
 class ExecutionTests(unittest.TestCase):
+    def test_external_sort_scratch_is_scoped_ephemeral_and_not_an_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args, fake_bin = prepare_run(root, paired=False)
+            counter = root / "calls.log"
+            scratch = root / "sort-scratch"
+            scratch.mkdir()
+            unrelated = scratch / "unrelated-file.txt"
+            unrelated.write_text("preserve me\n", encoding="utf-8")
+            code, error = run_with_tools(
+                [
+                    *args,
+                    "--sort-temp-dir",
+                    str(scratch),
+                    "--keep-intermediates",
+                ],
+                fake_bin,
+                counter=counter,
+            )
+            self.assertEqual(code, 0, error)
+            output = root / "out"
+            plan = json.loads(
+                (output / "config" / "command_plan.json").read_text()
+            )
+            bam_step = next(
+                step for step in plan["steps"] if step["phase"] == "bam_process"
+            )
+            sort = next(
+                command["argv"]
+                for action in bam_step["actions"]
+                if action["type"] == "pipeline"
+                for command in action["commands"]
+                if command["argv"][1] == "sort"
+            )
+            prefix = Path(sort[sort.index("-T") + 1])
+            coordinate_bam = Path(sort[sort.index("-o") + 1])
+            self.assertTrue(coordinate_bam.resolve().is_relative_to(output.resolve()))
+            self.assertFalse(
+                coordinate_bam.resolve().is_relative_to(scratch.resolve())
+            )
+            self.assertFalse(prefix.parent.exists())
+            self.assertTrue(scratch.is_dir())
+            self.assertEqual(unrelated.read_text(), "preserve me\n")
+            for path in (
+                output / "bam" / "sample_01.final.bam",
+                output / "bam" / "sample_01.final.bam.bai",
+                output / "qc" / "samtools" / "sample_01.flagstat.txt",
+                output / "qc" / "samtools" / "sample_01.stats.txt",
+                output / "qc" / "samtools" / "sample_01.idxstats.txt",
+            ):
+                self.assertTrue(path.is_file(), path)
+                self.assertTrue(path.resolve().is_relative_to(output.resolve()))
+                self.assertFalse(path.resolve().is_relative_to(scratch.resolve()))
+            manifest = json.loads((output / "output_manifest.json").read_text())
+            self.assertNotIn(str(scratch), json.dumps(manifest))
+
+    def test_sort_scratch_changes_do_not_invalidate_completed_bam_process(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args, fake_bin = prepare_run(root, paired=False)
+            counter = root / "calls.log"
+            scratch_a = root / "scratch-a"
+            scratch_b = root / "scratch-b"
+            code, error = run_with_tools(
+                [*args, "--sort-temp-dir", str(scratch_a)],
+                fake_bin,
+                counter=counter,
+            )
+            self.assertEqual(code, 0, error)
+
+            counter.unlink()
+            code, error = run_with_tools(
+                [*args, "--sort-temp-dir", str(scratch_b)],
+                fake_bin,
+                counter=counter,
+            )
+            self.assertEqual(code, 0, error)
+            self.assertEqual(
+                samtools_subcommand_calls(
+                    counter, {"fixmate", "sort", "markdup"}
+                ),
+                [],
+            )
+
+            counter.unlink()
+            code, error = run_with_tools(args, fake_bin, counter=counter)
+            self.assertEqual(code, 0, error)
+            self.assertEqual(
+                samtools_subcommand_calls(
+                    counter, {"fixmate", "sort", "markdup"}
+                ),
+                [],
+            )
+
+    def test_jobs_two_executes_distinct_sort_prefixes_in_one_run_namespace(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args, fake_bin = prepare_two_sample_run(root)
+            counter = root / "calls.log"
+            scratch = root / "sort-scratch"
+            code, error = run_with_tools(
+                [
+                    *args,
+                    "--jobs",
+                    "2",
+                    "--sort-temp-dir",
+                    str(scratch),
+                ],
+                fake_bin,
+                counter=counter,
+            )
+            self.assertEqual(code, 0, error)
+            sort_calls = samtools_subcommand_calls(counter, {"sort"})
+            self.assertEqual(len(sort_calls), 2)
+            prefixes = []
+            for call in sort_calls:
+                argv = call.split("\t", 1)[1].split()
+                self.assertEqual(argv.count("-T"), 1)
+                prefixes.append(Path(argv[argv.index("-T") + 1]))
+            self.assertEqual(len(set(prefixes)), 2)
+            self.assertEqual(prefixes[0].parents[1], prefixes[1].parents[1])
+            self.assertEqual(
+                {prefix.parent.name for prefix in prefixes},
+                {"sample_01", "sample_02"},
+            )
+
+    def test_failed_sort_cleanup_preserves_scratch_root_and_unrelated_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args, fake_bin = prepare_run(root, paired=False)
+            counter = root / "calls.log"
+            scratch = root / "sort-scratch"
+            scratch.mkdir()
+            unrelated = scratch / "unrelated-file.txt"
+            unrelated.write_text("preserve me\n", encoding="utf-8")
+            code, _error = run_with_tools(
+                [*args, "--sort-temp-dir", str(scratch)],
+                fake_bin,
+                counter=counter,
+                fail="samtools",
+                fail_subcommand="sort",
+            )
+            self.assertEqual(code, 3)
+            sort_call = samtools_subcommand_calls(counter, {"sort"})[0]
+            argv = sort_call.split("\t", 1)[1].split()
+            prefix = Path(argv[argv.index("-T") + 1])
+            self.assertFalse(prefix.parent.exists())
+            self.assertTrue(scratch.is_dir())
+            self.assertEqual(unrelated.read_text(), "preserve me\n")
+
     def test_parallel_bounded_fail_fast_and_mixed_outcome_resume(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
