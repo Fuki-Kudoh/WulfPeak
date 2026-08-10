@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+from concurrent.futures import ALL_COMPLETED, wait as futures_wait
 import gzip
 import io
 import json
@@ -10,6 +11,7 @@ import textwrap
 import threading
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from wulfpeak.cli import main
@@ -129,12 +131,16 @@ if name == "bowtie2":
         sync = Path(sync_dir)
         sync.mkdir(parents=True, exist_ok=True)
         sample = next(
-            (candidate for candidate in ("sample_01", "sample_02", "sample_03")
-             if candidate in " ".join(args)),
+            (candidate for candidate in (
+                "sample_01", "sample_02", "sample_03", "sample_04", "sample_05"
+            ) if candidate in " ".join(args)),
             "unknown",
         )
         (sync / f"{sample}.align.started").write_text("started\n")
-        while not (sync / "release-align").exists():
+        while not (
+            (sync / "release-align").exists()
+            or (sync / f"release-align.{sample}").exists()
+        ):
             time.sleep(0.01)
     if not fail:
         sys.stdout.buffer.write(b"synthetic alignment\n")
@@ -189,6 +195,22 @@ if name == "samtools":
     raise SystemExit(0)
 
 if name == "bamCoverage":
+    sync_dir = os.environ.get("WULFPEAK_FAKE_COVERAGE_SYNC_DIR")
+    if sync_dir:
+        sync = Path(sync_dir)
+        sync.mkdir(parents=True, exist_ok=True)
+        sample = next(
+            (candidate for candidate in (
+                "sample_01", "sample_02", "sample_03", "sample_04", "sample_05"
+            ) if candidate in " ".join(args)),
+            "unknown",
+        )
+        (sync / f"{sample}.coverage.started").write_text("started\n")
+        while not (
+            (sync / "release-coverage").exists()
+            or (sync / f"release-coverage.{sample}").exists()
+        ):
+            time.sleep(0.01)
     destination = Path(option("--outFileName"))
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_bytes(b"bad!" if invalid else b"\x26\xfc\x8f\x88synthetic\n")
@@ -284,6 +306,22 @@ def prepare_two_sample_run(root: Path) -> tuple[list[str], Path]:
     return args, fake_bin
 
 
+def prepare_sample_run(root: Path, count: int) -> tuple[list[str], Path]:
+    """Prepare a single-end run with an ordered synthetic sample set."""
+
+    args, fake_bin = prepare_run(root, paired=False)
+    rows = ["input_id\tsample_id\tgroup_id\tpeak_type\tcontrol\tqvalue"]
+    for index in range(1, count + 1):
+        rows.append(
+            f"library_{index:02}\tsample_{index:02}\tgroup_{index:02}"
+            "\tinput\t.\t."
+        )
+        if index > 1:
+            write_fastq(root / "fastq" / f"library_{index:02}.fastq.gz")
+    (root / "samples.tsv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+    return args, fake_bin
+
+
 def run_with_tools(
     args: list[str], fake_bin: Path, *, counter: Path, fail: str | None = None,
     fail_sample: str | None = None, fail_subcommand: str | None = None,
@@ -334,7 +372,201 @@ def samtools_analysis_calls(counter: Path) -> int:
     )
 
 
+def wait_for_paths(paths: set[Path], *, timeout: float = 15) -> None:
+    deadline = time.monotonic() + timeout
+    while not all(path.exists() for path in paths):
+        if time.monotonic() >= deadline:
+            missing = sorted(str(path) for path in paths if not path.exists())
+            raise AssertionError(f"timed out waiting for markers: {missing}")
+        time.sleep(0.01)
+
+
+def shared_step_status(output: Path, sample_id: str, phase: str) -> str | None:
+    try:
+        payload = json.loads((output / "status" / "state.json").read_text())
+    except FileNotFoundError:
+        return None
+    state = payload.get("steps", {}).get(f"sample:{sample_id}:{phase}")
+    return state.get("status") if isinstance(state, dict) else None
+
+
 class ExecutionTests(unittest.TestCase):
+    def test_parallel_bounded_fail_fast_and_mixed_outcome_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args, fake_bin = prepare_sample_run(root, 4)
+            output = root / "out"
+            sync = root / "align-sync"
+            counter = root / "counter.tsv"
+            result: list[int] = []
+            with environment(
+                PATH=f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                WULFPEAK_FAKE_SYNC_DIR=str(sync),
+                WULFPEAK_FAKE_COUNTER=str(counter),
+                WULFPEAK_FAKE_FAIL="bowtie2",
+                WULFPEAK_FAKE_FAIL_SAMPLE="sample_02",
+            ):
+                run = threading.Thread(
+                    target=lambda: result.append(main([*args, "--jobs", "2"]))
+                )
+                run.start()
+                wait_for_paths({
+                    sync / "sample_01.align.started",
+                    sync / "sample_02.align.started",
+                })
+                (sync / "release-align.sample_01").write_text("release\n")
+                wait_for_paths({sync / "sample_03.align.started"})
+                (sync / "release-align.sample_02").write_text("release\n")
+                deadline = time.monotonic() + 15
+                while shared_step_status(output, "sample_02", "align") != "failed":
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(0.01)
+                (sync / "release-align.sample_03").write_text("release\n")
+                run.join(timeout=30)
+
+            self.assertFalse(run.is_alive())
+            self.assertEqual(result, [3])
+            self.assertEqual(shared_step_status(output, "sample_01", "align"), "done")
+            self.assertEqual(shared_step_status(output, "sample_02", "align"), "failed")
+            self.assertEqual(shared_step_status(output, "sample_03", "align"), "done")
+            self.assertIsNone(shared_step_status(output, "sample_04", "align"))
+            self.assertFalse((sync / "sample_04.align.started").exists())
+            self.assertNotIn(
+                "samtools\tfixmate", counter.read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                (output / "status" / "pipeline.status").read_text().strip(),
+                "failed",
+            )
+
+            # Resume must reuse samples 01 and 03 and run only the failed and
+            # never-submitted alignment steps before crossing the barrier.
+            counter.unlink()
+            with environment(
+                PATH=f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                WULFPEAK_FAKE_COUNTER=str(counter),
+            ):
+                self.assertEqual(main([*args, "--jobs", "2"]), 0)
+            align_calls = [
+                line
+                for line in counter.read_text(encoding="utf-8").splitlines()
+                if line.startswith("bowtie2\t")
+            ]
+            self.assertEqual(len(align_calls), 2)
+            self.assertTrue(any("sample_02" in line for line in align_calls))
+            self.assertTrue(any("sample_04" in line for line in align_calls))
+            self.assertFalse(any("sample_01" in line for line in align_calls))
+            self.assertFalse(any("sample_03" in line for line in align_calls))
+            for sample_id in ("sample_01", "sample_02", "sample_03", "sample_04"):
+                self.assertEqual(shared_step_status(output, sample_id, "align"), "done")
+
+    def test_completion_batch_failure_submits_no_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args, fake_bin = prepare_sample_run(root, 3)
+            sync = root / "align-sync"
+            result: list[int] = []
+
+            def wait_for_entire_batch(futures, *, return_when):
+                return futures_wait(futures, return_when=ALL_COMPLETED)
+
+            with environment(
+                PATH=f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                WULFPEAK_FAKE_SYNC_DIR=str(sync),
+                WULFPEAK_FAKE_FAIL="bowtie2",
+                WULFPEAK_FAKE_FAIL_SAMPLE="sample_02",
+            ), mock.patch("wulfpeak.runner.wait", side_effect=wait_for_entire_batch):
+                run = threading.Thread(
+                    target=lambda: result.append(main([*args, "--jobs", "2"]))
+                )
+                run.start()
+                wait_for_paths({
+                    sync / "sample_01.align.started",
+                    sync / "sample_02.align.started",
+                })
+                (sync / "release-align").write_text("release\n")
+                run.join(timeout=30)
+
+            self.assertFalse(run.is_alive())
+            self.assertEqual(result, [3])
+            self.assertEqual(
+                shared_step_status(root / "out", "sample_01", "align"), "done"
+            )
+            self.assertEqual(
+                shared_step_status(root / "out", "sample_02", "align"), "failed"
+            )
+            self.assertFalse((sync / "sample_03.align.started").exists())
+            self.assertIsNone(
+                shared_step_status(root / "out", "sample_03", "align")
+            )
+
+    def test_parallel_coverage_barrier_runs_multiqc_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args, fake_bin = prepare_two_sample_run(root)
+            sync = root / "coverage-sync"
+            counter = root / "counter.tsv"
+            result: list[int] = []
+            with environment(
+                PATH=f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                WULFPEAK_FAKE_COVERAGE_SYNC_DIR=str(sync),
+                WULFPEAK_FAKE_COUNTER=str(counter),
+            ):
+                run = threading.Thread(
+                    target=lambda: result.append(main([*args, "--jobs", "2"]))
+                )
+                run.start()
+                wait_for_paths({
+                    sync / "sample_01.coverage.started",
+                    sync / "sample_02.coverage.started",
+                })
+                self.assertNotIn("multiqc\t", counter.read_text(encoding="utf-8"))
+                (sync / "release-coverage").write_text("release\n")
+                run.join(timeout=30)
+            self.assertFalse(run.is_alive())
+            self.assertEqual(result, [0])
+            self.assertEqual(
+                shared_step_status(root / "out", "sample_01", "coverage"), "done"
+            )
+            self.assertEqual(
+                shared_step_status(root / "out", "sample_02", "coverage"), "done"
+            )
+            self.assertEqual(tool_counts(counter).get("multiqc"), 1)
+
+    def test_parallel_coverage_failure_never_runs_multiqc(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args, fake_bin = prepare_two_sample_run(root)
+            sync = root / "coverage-sync"
+            counter = root / "counter.tsv"
+            result: list[int] = []
+            with environment(
+                PATH=f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                WULFPEAK_FAKE_COVERAGE_SYNC_DIR=str(sync),
+                WULFPEAK_FAKE_COUNTER=str(counter),
+                WULFPEAK_FAKE_FAIL="bamCoverage",
+                WULFPEAK_FAKE_FAIL_SAMPLE="sample_02",
+            ):
+                run = threading.Thread(
+                    target=lambda: result.append(main([*args, "--jobs", "2"]))
+                )
+                run.start()
+                wait_for_paths({
+                    sync / "sample_01.coverage.started",
+                    sync / "sample_02.coverage.started",
+                })
+                (sync / "release-coverage").write_text("release\n")
+                run.join(timeout=30)
+            self.assertFalse(run.is_alive())
+            self.assertEqual(result, [3])
+            self.assertEqual(
+                shared_step_status(root / "out", "sample_01", "coverage"), "done"
+            )
+            self.assertEqual(
+                shared_step_status(root / "out", "sample_02", "coverage"), "failed"
+            )
+            self.assertNotIn("multiqc", tool_counts(counter))
+
     def test_jobs_two_overlaps_align_and_preserves_bam_phase_barrier(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
