@@ -110,7 +110,8 @@ wulfpeak run \
   --genome-id synthetic_reference \
   --bowtie2-index /path/to/index/prefix \
   --effective-genome-size 1000000 \
-  --threads 8 \
+  --threads 6 \
+  --jobs 2 \
   --dry-run
 ```
 
@@ -160,7 +161,16 @@ applicable sample. Execution remains fail-fast: one sample failure stops the
 run, and resume skips reusable completed samples in that phase before
 continuing from failed or incomplete work.
 
-`--threads` is an approximate per-sample CPU budget. Concurrent pipelines use
+`--threads` is the approximate CPU budget for one sample-scoped step, while
+`--jobs` is the maximum number of sample-scoped steps that may run concurrently
+within the active phase. Thus `--threads 6 --jobs 2` has an approximate
+run-level CPU demand of `jobs × threads`, or 12 CPUs. WulfPeak does not detect
+available CPUs, throttle resources, or reduce `threads` when `jobs` increases.
+Phase barriers remain intact: every required sample in a phase must finish
+successfully before the next phase starts. Pipeline-scoped MultiQC still runs
+exactly once.
+
+Within each sample step, WulfPeak uses
 a centralized allocation policy instead of assigning that full value to every
 process: alignment divides the budget between Bowtie2 and the samtools collate
 main/worker threads, while BAM processing reserves one main thread each for

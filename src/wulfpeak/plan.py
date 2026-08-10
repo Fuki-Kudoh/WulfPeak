@@ -780,6 +780,7 @@ def build_command_plan(
         "dry_run": config.dry_run,
         "read_layout": config.read_layout.value,
         "stop_after": selected_stop,
+        "jobs": config.jobs,
         "thread_allocation": thread_allocation.as_plan_metadata(),
         "artifact_contract": {
             "command_outputs": "write temporary_path only",

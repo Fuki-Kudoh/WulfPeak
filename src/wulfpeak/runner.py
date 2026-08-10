@@ -6,7 +6,8 @@ import json
 import platform
 import shutil
 import socket
-from dataclasses import replace
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -27,6 +28,77 @@ from .status import (
     write_step_state,
 )
 from .validators import validate_artifact
+
+
+@dataclass(frozen=True)
+class _SampleWork:
+    step: dict[str, object]
+    sample_id: str
+    phase: str
+    signature: str
+    log_path: Path
+    output_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _StepOutcome:
+    work: _SampleWork
+    state: StepState
+    error: BaseException | None = None
+
+
+def _execute_sample_step(
+    output_dir: Path, executor: StepExecutor, work: _SampleWork
+) -> _StepOutcome:
+    """Execute one external-process step without mutating coordinator state."""
+
+    started = _now()
+    running = StepState(
+        work.phase,
+        "running",
+        signature=work.signature,
+        started_at=started,
+        log_path=str(work.log_path),
+        output_ids=work.output_ids,
+    )
+    write_step_state(
+        output_dir, running, scope="samples", scope_id=work.sample_id
+    )
+    try:
+        executor.execute(work.step, work.log_path)
+    except BaseException as exc:
+        failed = StepState(
+            work.phase,
+            "failed",
+            signature=work.signature,
+            started_at=started,
+            finished_at=_now(),
+            exit_code=(
+                exc.returncode
+                if isinstance(exc, CommandExecutionError)
+                and exc.returncode is not None
+                else 1
+            ),
+            log_path=str(work.log_path),
+            output_ids=work.output_ids,
+            last_error=str(exc),
+        )
+        write_step_state(
+            output_dir, failed, scope="samples", scope_id=work.sample_id
+        )
+        return _StepOutcome(work, failed, exc)
+    done = StepState(
+        work.phase,
+        "done",
+        signature=work.signature,
+        started_at=started,
+        finished_at=_now(),
+        exit_code=0,
+        log_path=str(work.log_path),
+        output_ids=work.output_ids,
+    )
+    write_step_state(output_dir, done, scope="samples", scope_id=work.sample_id)
+    return _StepOutcome(work, done)
 
 
 def _now() -> str:
@@ -455,151 +527,104 @@ def prepare_run(config: RunConfig, argv: list[str]) -> tuple[Path, Path, Path]:
             ),
         )
         write_pipeline_status(config.output_dir, "running")
-        try:
-            for step in plan["steps"]:
-                if not isinstance(step, dict):
-                    raise CommandExecutionError("Command plan contains a malformed step")
-                if step.get("scope") == "pipeline":
-                    phase = str(step["phase"])
-                    scope_id = str(step["scope_id"])
-                    if phase != "multiqc":
-                        raise CommandExecutionError(
-                            f"The {selected_stop} execution boundary does not support "
-                            f"pipeline phase {phase}"
-                        )
-                    signature = _pipeline_step_signature(
-                        step,
-                        result,
-                        upstream_signatures=upstream_signatures,
-                    )
-                    log_path = config.output_dir / "logs" / "pipeline" / f"{phase}.log"
-                    output_ids = _artifact_ids(step)
-                    forced = (
-                        force_index is not None and PHASES.index(phase) >= force_index
-                    )
-                    state = states.get(_state_id(step))
-                    reusable = (
-                        config.resume
-                        and not forced
-                        and can_reuse_step(
-                            state,
-                            signature,
-                            outputs_valid=_outputs_valid(step, samtools=samtools),
-                            upstream_reusable=all(chain_unchanged.values()),
-                        )
-                    )
-                    if reusable:
-                        continue
+        def run_pipeline_step(step: dict[str, object]) -> None:
+            phase = str(step["phase"])
+            scope_id = str(step["scope_id"])
+            if phase != "multiqc":
+                raise CommandExecutionError(
+                    f"The {selected_stop} execution boundary does not support "
+                    f"pipeline phase {phase}"
+                )
+            signature = _pipeline_step_signature(
+                step, result, upstream_signatures=upstream_signatures
+            )
+            log_path = config.output_dir / "logs" / "pipeline" / f"{phase}.log"
+            output_ids = _artifact_ids(step)
+            forced = force_index is not None and PHASES.index(phase) >= force_index
+            state = states.get(_state_id(step))
+            if (
+                config.resume
+                and not forced
+                and can_reuse_step(
+                    state,
+                    signature,
+                    outputs_valid=_outputs_valid(step, samtools=samtools),
+                    upstream_reusable=all(chain_unchanged.values()),
+                )
+            ):
+                return
+            reset_step_temporary(config.output_dir, step)
+            step_started = _now()
+            running = StepState(
+                phase, "running", signature=signature, started_at=step_started,
+                log_path=str(log_path), output_ids=output_ids,
+            )
+            write_step_state(
+                config.output_dir, running, scope="pipeline", scope_id=scope_id
+            )
+            try:
+                executor.execute(step, log_path)
+            except BaseException as exc:
+                failed = StepState(
+                    phase, "failed", signature=signature, started_at=step_started,
+                    finished_at=_now(),
+                    exit_code=(
+                        exc.returncode
+                        if isinstance(exc, CommandExecutionError)
+                        and exc.returncode is not None else 1
+                    ),
+                    log_path=str(log_path), output_ids=output_ids,
+                    last_error=str(exc),
+                )
+                write_step_state(
+                    config.output_dir, failed, scope="pipeline", scope_id=scope_id
+                )
+                raise CommandExecutionError(
+                    f"Step {phase} failed for pipeline {scope_id}: {exc}"
+                ) from exc
+            done = StepState(
+                phase, "done", signature=signature, started_at=step_started,
+                finished_at=_now(), exit_code=0, log_path=str(log_path),
+                output_ids=output_ids,
+            )
+            write_step_state(
+                config.output_dir, done, scope="pipeline", scope_id=scope_id
+            )
+            states[_state_id(step)] = done
 
-                    reset_step_temporary(config.output_dir, step)
-                    step_started = _now()
-                    running = StepState(
-                        phase,
-                        "running",
-                        signature=signature,
-                        started_at=step_started,
-                        log_path=str(log_path),
-                        output_ids=output_ids,
-                    )
-                    write_step_state(
-                        config.output_dir,
-                        running,
-                        scope="pipeline",
-                        scope_id=scope_id,
-                    )
-                    try:
-                        executor.execute(step, log_path)
-                    except BaseException as exc:
-                        failed = StepState(
-                            phase,
-                            "failed",
-                            signature=signature,
-                            started_at=step_started,
-                            finished_at=_now(),
-                            exit_code=(
-                                exc.returncode
-                                if isinstance(exc, CommandExecutionError)
-                                and exc.returncode is not None
-                                else 1
-                            ),
-                            log_path=str(log_path),
-                            output_ids=output_ids,
-                            last_error=str(exc),
-                        )
-                        write_step_state(
-                            config.output_dir,
-                            failed,
-                            scope="pipeline",
-                            scope_id=scope_id,
-                        )
-                        raise CommandExecutionError(
-                            f"Step {phase} failed for pipeline {scope_id}: {exc}"
-                        ) from exc
-                    done = StepState(
-                        phase,
-                        "done",
-                        signature=signature,
-                        started_at=step_started,
-                        finished_at=_now(),
-                        exit_code=0,
-                        log_path=str(log_path),
-                        output_ids=output_ids,
-                    )
-                    write_step_state(
-                        config.output_dir,
-                        done,
-                        scope="pipeline",
-                        scope_id=scope_id,
-                    )
-                    states[_state_id(step)] = done
-                    continue
-
-                if step.get("scope") != "sample":
-                    raise CommandExecutionError(
-                        f"The {selected_stop} execution boundary only supports "
-                        "sample and pipeline steps"
-                    )
+        def next_sample_work(
+            phase_steps: list[dict[str, object]], position: int
+        ) -> tuple[_SampleWork | None, int]:
+            # Reusable steps are coordinator-only outcomes. Continue until actual
+            # work is found or this ordered phase is exhausted.
+            while position < len(phase_steps):
+                step = phase_steps[position]
+                position += 1
                 sample_id = str(step["scope_id"])
                 phase = str(step["phase"])
                 resolved = resolved_by_id[sample_id]
                 signature = _step_signature(
-                    step,
-                    resolved,
-                    config,
-                    result,
+                    step, resolved, config, result,
                     upstream_signature=upstream_signatures[sample_id],
                 )
-                log_path = (
-                    config.output_dir / "logs" / "samples" / sample_id / f"{phase}.log"
-                )
-                output_ids = _artifact_ids(step)
-                forced = force_index is not None and PHASES.index(phase) >= force_index
                 state = states.get(_state_id(step))
                 outputs_valid = _outputs_valid(step, samtools=samtools)
                 if (
-                    phase == "align"
-                    and not config.keep_intermediates
-                    and state is not None
-                    and state.status == "done"
+                    phase == "align" and not config.keep_intermediates
+                    and state is not None and state.status == "done"
                     and not state.output_ids
                 ):
                     outputs_valid = _retired_alignment_can_resume(
-                        config=config,
-                        result=result,
-                        resolved=resolved,
-                        alignment_signature=signature,
-                        states=states,
+                        config=config, result=result, resolved=resolved,
+                        alignment_signature=signature, states=states,
                         steps_by_phase=steps_by_sample[sample_id],
-                        samtools=samtools,
-                        force_index=force_index,
+                        samtools=samtools, force_index=force_index,
                     )
+                forced = force_index is not None and PHASES.index(phase) >= force_index
                 reusable = (
-                    config.resume
-                    and not forced
+                    config.resume and not forced
                     and can_reuse_step(
-                        state,
-                        signature,
-                        outputs_valid=outputs_valid,
+                        state, signature, outputs_valid=outputs_valid,
                         upstream_reusable=chain_unchanged[sample_id],
                     )
                 )
@@ -608,63 +633,100 @@ def prepare_run(config: RunConfig, argv: list[str]) -> tuple[Path, Path, Path]:
                     if phase == "bam_process" and not config.keep_intermediates:
                         _cleanup_sample_intermediates(config, sample_id, states)
                     continue
-
                 chain_unchanged[sample_id] = False
                 reset_step_temporary(config.output_dir, step)
-                step_started = _now()
-                running = StepState(
-                    phase,
-                    "running",
+                return _SampleWork(
+                    step=step, sample_id=sample_id, phase=phase,
                     signature=signature,
-                    started_at=step_started,
-                    log_path=str(log_path),
-                    output_ids=output_ids,
-                )
-                write_step_state(
-                    config.output_dir, running, scope="samples", scope_id=sample_id
-                )
-                try:
-                    executor.execute(step, log_path)
-                except BaseException as exc:
-                    failed = StepState(
-                        phase,
-                        "failed",
-                        signature=signature,
-                        started_at=step_started,
-                        finished_at=_now(),
-                        exit_code=(
-                            exc.returncode
-                            if isinstance(exc, CommandExecutionError)
-                            and exc.returncode is not None
-                            else 1
-                        ),
-                        log_path=str(log_path),
-                        output_ids=output_ids,
-                        last_error=str(exc),
-                    )
-                    write_step_state(
-                        config.output_dir, failed, scope="samples", scope_id=sample_id
-                    )
+                    log_path=(config.output_dir / "logs" / "samples" / sample_id
+                              / f"{phase}.log"),
+                    output_ids=_artifact_ids(step),
+                ), position
+            return None, position
+
+        def run_sample_phase(phase_steps: list[dict[str, object]]) -> None:
+            position = 0
+            in_flight: dict[Future[_StepOutcome], _SampleWork] = {}
+            failures: list[_StepOutcome] = []
+            with ThreadPoolExecutor(
+                max_workers=config.jobs, thread_name_prefix="wulfpeak-sample"
+            ) as pool:
+                while len(in_flight) < config.jobs:
+                    work, position = next_sample_work(phase_steps, position)
+                    if work is None:
+                        break
+                    in_flight[pool.submit(
+                        _execute_sample_step, config.output_dir, executor, work
+                    )] = work
+
+                while in_flight:
+                    completed, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+                    # Snapshot and inspect the entire completion batch before any
+                    # replacement is submitted.
+                    outcomes = [future.result() for future in completed]
+                    for future in completed:
+                        del in_flight[future]
+                    for outcome in outcomes:
+                        work = outcome.work
+                        states[_state_id(work.step)] = outcome.state
+                        if outcome.error is None:
+                            upstream_signatures[work.sample_id] = work.signature
+                            if (
+                                work.phase == "bam_process"
+                                and not config.keep_intermediates
+                            ):
+                                _cleanup_sample_intermediates(
+                                    config, work.sample_id, states
+                                )
+                        else:
+                            failures.append(outcome)
+                    if failures:
+                        continue
+                    while len(in_flight) < config.jobs:
+                        work, position = next_sample_work(phase_steps, position)
+                        if work is None:
+                            break
+                        in_flight[pool.submit(
+                            _execute_sample_step, config.output_dir, executor, work
+                        )] = work
+            if failures:
+                first = failures[0]
+                raise CommandExecutionError(
+                    f"Step {first.work.phase} failed for sample "
+                    f"{first.work.sample_id}: {first.error}"
+                ) from first.error
+
+        try:
+            planned_steps = plan["steps"]
+            if not isinstance(planned_steps, list):
+                raise CommandExecutionError("Command plan contains malformed steps")
+            index = 0
+            while index < len(planned_steps):
+                raw_step = planned_steps[index]
+                if not isinstance(raw_step, dict):
+                    raise CommandExecutionError("Command plan contains a malformed step")
+                phase = str(raw_step["phase"])
+                phase_steps: list[dict[str, object]] = []
+                while index < len(planned_steps):
+                    candidate = planned_steps[index]
+                    if not isinstance(candidate, dict):
+                        raise CommandExecutionError(
+                            "Command plan contains a malformed step"
+                        )
+                    if str(candidate["phase"]) != phase:
+                        break
+                    phase_steps.append(candidate)
+                    index += 1
+                scopes = {str(step.get("scope")) for step in phase_steps}
+                if scopes == {"sample"}:
+                    run_sample_phase(phase_steps)
+                elif scopes == {"pipeline"} and len(phase_steps) == 1:
+                    run_pipeline_step(phase_steps[0])
+                else:
                     raise CommandExecutionError(
-                        f"Step {phase} failed for sample {sample_id}: {exc}"
-                    ) from exc
-                done = StepState(
-                    phase,
-                    "done",
-                    signature=signature,
-                    started_at=step_started,
-                    finished_at=_now(),
-                    exit_code=0,
-                    log_path=str(log_path),
-                    output_ids=output_ids,
-                )
-                write_step_state(
-                    config.output_dir, done, scope="samples", scope_id=sample_id
-                )
-                states[_state_id(step)] = done
-                upstream_signatures[sample_id] = signature
-                if phase == "bam_process" and not config.keep_intermediates:
-                    _cleanup_sample_intermediates(config, sample_id, states)
+                        f"The {selected_stop} execution boundary only supports "
+                        "sample phases and single pipeline steps"
+                    )
 
             _write_output_manifest(
                 config, plan, samtools=samtools, completed_through=str(selected_stop)

@@ -79,6 +79,12 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--bowtie2-index", required=True)
     run.add_argument("--effective-genome-size", required=True, type=_positive_int)
     run.add_argument("--threads", required=True, type=_positive_int)
+    run.add_argument(
+        "--jobs",
+        type=_positive_int,
+        default=1,
+        help="maximum concurrently running sample-scoped steps (default: 1)",
+    )
     run.add_argument("--min-mapq", type=_nonnegative_int, default=30)
     run.add_argument("--duplicate-policy", choices=("remove", "keep"), default="remove")
     run.add_argument("--allow-dovetail", action="store_true")
@@ -159,6 +165,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         bowtie2_index=Path(args.bowtie2_index).expanduser().resolve(),
         effective_genome_size=args.effective_genome_size,
         threads=args.threads,
+        jobs=args.jobs,
         read_layout=_layout(args),
         min_mapq=args.min_mapq,
         duplicate_policy=args.duplicate_policy,

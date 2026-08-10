@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -35,6 +36,40 @@ INDEX_SUFFIXES = (".1", ".2", ".3", ".4", ".rev.1", ".rev.2")
 
 
 class FoundationTests(unittest.TestCase):
+    def test_concurrent_shared_state_updates_do_not_lose_sample_results(self) -> None:
+        # Repeat simultaneous writes so an unlocked read-modify-write
+        # implementation reliably loses one of the two entries.
+        for iteration in range(20):
+            with tempfile.TemporaryDirectory() as temporary:
+                output = Path(temporary)
+                barrier = threading.Barrier(2)
+
+                def write(sample_id: str) -> None:
+                    barrier.wait()
+                    write_step_state(
+                        output,
+                        StepState("align", "done", signature=sample_id),
+                        scope="samples",
+                        scope_id=sample_id,
+                    )
+
+                threads = [
+                    threading.Thread(target=write, args=(f"sample_{index}",))
+                    for index in (1, 2)
+                ]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join()
+                payload = json.loads(
+                    (output / "status" / "state.json").read_text()
+                )
+                self.assertEqual(
+                    set(payload["steps"]),
+                    {"sample:sample_1:align", "sample:sample_2:align"},
+                    iteration,
+                )
+
     def test_accepts_complete_small_and_large_bowtie2_index_families(self) -> None:
         for extension in (".bt2", ".bt2l"):
             with self.subTest(extension=extension), tempfile.TemporaryDirectory() as temporary:
