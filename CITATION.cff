@@ -1,0 +1,33 @@
+cff-version: 1.2.0
+message: "If you use WulfPeak in your research, please cite this software."
+title: "WulfPeak"
+type: software
+version: "0.2.2"
+date-released: "2026-08-10"
+
+authors:
+  - family-names: "Kudoh"
+    given-names: "Fuki"
+    affiliation: "Tokyo Metropolitan Institute of Medical Science"
+    orcid: "https://orcid.org/0000-0001-8986-4216"
+
+abstract: >-
+  WulfPeak is a lightweight command-line pipeline for ChIP-seq
+  preprocessing and analysis. It provides FASTQ quality control,
+  trimming, Bowtie2 alignment, BAM processing, normalized BigWig
+  generation, MultiQC reporting, resumable execution, sample-level
+  parallelism, and reproducible provenance tracking.
+
+keywords:
+  - ChIP-seq
+  - epigenomics
+  - bioinformatics
+  - Bowtie2
+  - deepTools
+  - MultiQC
+  - chromatin
+
+license: "MIT"
+
+repository-code: "https://github.com/Fuki-Kudoh/WulfPeak"
+url: "https://github.com/Fuki-Kudoh/WulfPeak"
