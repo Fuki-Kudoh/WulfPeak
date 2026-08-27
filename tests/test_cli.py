@@ -23,8 +23,8 @@ def working_directory(path: Path):
 
 
 class CliTests(unittest.TestCase):
-    def test_release_version_is_v022(self) -> None:
-        self.assertEqual(__version__, "0.2.2")
+    def test_release_version_is_v023(self) -> None:
+        self.assertEqual(__version__, "0.2.3")
 
     def test_check_resolves_default_fastq_dir_and_writes_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
