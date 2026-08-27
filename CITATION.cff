@@ -2,8 +2,8 @@ cff-version: 1.2.0
 message: "If you use WulfPeak in your research, please cite this software."
 title: "WulfPeak"
 type: software
-version: "0.2.2"
-date-released: "2026-08-10"
+version: "0.2.3"
+date-released: "2026-08-27"
 
 authors:
   - family-names: "Kudoh"

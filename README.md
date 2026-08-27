@@ -1,7 +1,7 @@
 # WulfPeak
 
 WulfPeak uses a compact samplesheet and exact, non-recursive FASTQ discovery.
-The v0.2.2 implementation supports paired-end (default) and single-end input
+The v0.2.3 implementation supports paired-end (default) and single-end input
 validation, deterministic command plans, status inspection, conservative
 resume, real per-sample execution through normalized BigWig coverage, and a
 pipeline-scoped MultiQC report after all samples complete coverage.
